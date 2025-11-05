@@ -27,3 +27,5 @@ pyhwp==0.1.7
 olefile
 
 lxml
+cloudconvert-python
+requests
