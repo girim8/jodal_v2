@@ -521,7 +521,7 @@ def login_gate():
     except Exception:
         allowed = []
 
-    col1, col2, col3 = st.columns([1,1,1])
+    col1, col2 = st.columns([1,1])
     with col1:
         if st.button("로그인", type="primary", use_container_width=True):
             ok = False
@@ -534,12 +534,7 @@ def login_gate():
                 st.success("로그인 성공"); st.rerun()
             else:
                 st.error("인증 실패. 사번/생년월일을 확인하세요.")
-    with col2:
-        if st.button("관리자 바로 로그인", use_container_width=True):
-            st.session_state["authed"] = True
-            st.session_state["role"] = "admin"
-            st.success("관리자 로그인 완료"); st.rerun()
-    with col3:
+    with coL2:
         st.info("사번/생년월일은 사내 배포용으로만 사용됩니다.")
 
 # =====================================
