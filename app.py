@@ -1,20 +1,25 @@
 # -*- coding: utf-8 -*-
 # app.py — Streamlit Cloud 단일 파일 통합본 (A안, 2분할 중 1/2)
-# - Secrets(API_KEYS, [[AUTH.users]]) 안정 파싱
+# - Secrets(API_KEYS, [[AUTH.users]], CLOUDCONVERT_API_KEY) 안정 파싱
 # - 로그인(팝업 없음) + 관리자 백도어(emp=2855, dob=910518)
 # - 업로드 엑셀(filtered 시트) 로드/필터/차트/다운로드
 # - 첨부 링크 매트릭스 + Compact 카드 UI
-# - HWP/HWPX/DOCX/PPTX/XLSX/PDF 변환: hwp5txt → unoconv → soffice →(실패 시) 간이 PDF
+# - **파일 변환 전략(요청 반영): 1) pyhwp(또는 hwp5txt) → 텍스트→간이PDF  2) CloudConvert API → PDF**
+#   (그 외 soffice/unoconv 등은 제거)
 # - OpenAI v1/v0.28 호환 call_gpt 래퍼 (proxies 인자 사용 금지)
 # - 보고서(.md/.pdf) 생성 + 변환 PDF 묶음 다운로드 + 컨텍스트 챗봇
 # - Python 3.11 기준, Streamlit Cloud 권장 버전은 문서 하단 주석 참고
 
 import os
 import re
+import io
+import json
+import base64
 import zipfile
 import shutil
-import subprocess
+import requests
 import tempfile
+import subprocess
 from io import BytesIO
 from urllib.parse import urlparse, unquote
 from textwrap import dedent
@@ -62,7 +67,7 @@ def _redact_secrets(text: str) -> str:
     if not isinstance(text, str):
         return text
     text = re.sub(r"sk-[A-Za-z0-9_\-]{20,}", "[REDACTED_KEY]", text)
-    text = re.sub(r'(?i)\b(gpt_api_key|OPENAI_API_KEY)\s*=\s*([\'"]).*?\2', r'\1=\2[REDACTED]\2', text)
+    text = re.sub(r'(?i)\b(gpt_api_key|OPENAI_API_KEY|CLOUDCONVERT_API_KEY)\s*=\s*([\'\"]) .*? \2', r'\1=\2[REDACTED]\2', text)
     return text
 
 # =============================
@@ -176,106 +181,111 @@ def call_gpt(messages, temperature=0.4, max_tokens=2000, model="gpt-4.1"):
         raise Exception(f"GPT 호출 실패:\n\n{e}")
 
 # =============================
-# 변환/추출 유틸 — HWP/HWPX/PDF 파이프라인
+# CloudConvert API 헬퍼 (요청 반영)
 # =============================
-def _which(cmd: str):
-    return shutil.which(cmd)
+CLOUDCONVERT_API_BASE = "https://api.cloudconvert.com/v2"
 
-def _safe_tmp_write(data: bytes, suffix: str) -> str:
-    fd, path = tempfile.mkstemp(suffix=suffix)
-    os.close(fd)
-    with open(path, "wb") as f:
-        f.write(data)
-    return path
-
-def convert_hwp_with_hwp5txt(input_bytes: bytes):
-    exe = _which("hwp5txt")
-    if not exe:
-        return None, "hwp5txt 미설치"
-    in_path = _safe_tmp_write(input_bytes, ".hwp")
+def _get_cloudconvert_key() -> str | None:
+    # 키는 st.secrets 또는 환경변수에서만 읽음 (직접 하드코딩 금지)
+    key = None
     try:
-        cp = subprocess.run([exe, in_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
-        if cp.returncode != 0:
-            return None, f"hwp5txt 실패: {cp.stderr.decode(errors='ignore')[:200]}"
-        text = cp.stdout.decode("utf-8", errors="ignore").strip()
-        return text or "", "OK[hwp5txt]"
-    except subprocess.TimeoutExpired:
-        return None, "hwp5txt 타임아웃"
+        key = st.secrets.get("CLOUDCONVERT_API_KEY") if "CLOUDCONVERT_API_KEY" in st.secrets else None
+    except Exception:
+        key = None
+    return key or os.environ.get("CLOUDCONVERT_API_KEY")
+
+@st.cache_data(show_spinner=False)
+def _cloudconvert_supported() -> bool:
+    return _get_cloudconvert_key() is not None
+
+def cloudconvert_convert_to_pdf(file_bytes: bytes, filename: str, timeout_sec: int = 120) -> tuple[bytes | None, str]:
+    """
+    CloudConvert v2 Jobs API 사용
+    - import/base64 → convert(pdf) → export/url
+    - 완료 후 export URL에서 결과 pdf 다운로드
+    """
+    api_key = _get_cloudconvert_key()
+    if not api_key:
+        return None, "CloudConvert 키 없음(st.secrets.CLOUDCONVERT_API_KEY)"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    # 1) Job 생성
+    job_payload = {
+        "tasks": {
+            "import-my-file": {
+                "operation": "import/base64",
+                "file": base64.b64encode(file_bytes).decode("ascii"),
+                "filename": filename,
+            },
+            "convert-it": {
+                "operation": "convert",
+                "input": "import-my-file",
+                "output_format": "pdf",
+            },
+            "export-it": {
+                "operation": "export/url",
+                "input": "convert-it",
+                "inline": False,
+                "archive_multiple_files": False,
+            },
+        }
+    }
+    try:
+        r = requests.post(f"{CLOUDCONVERT_API_BASE}/jobs", headers=headers, data=json.dumps(job_payload), timeout=30)
+        r.raise_for_status()
+        job = r.json().get("data", {})
+        job_id = job.get("id")
+        if not job_id:
+            return None, f"CloudConvert Job 생성 실패: {r.text[:200]}"
     except Exception as e:
-        return None, f"hwp5txt 실행 오류: {e}"
-    finally:
-        try:
-            os.remove(in_path)
-        except Exception:
-            pass
+        return None, f"CloudConvert Job 생성 예외: {e}"
 
-def convert_with_unoconv(input_bytes: bytes, in_suffix: str):
-    exe = _which("unoconv")
-    if not exe:
-        return None, "unoconv 미설치"
-    in_path = _safe_tmp_write(input_bytes, in_suffix)
-    out_dir = os.path.dirname(in_path)
-    try:
-        cp = subprocess.run([exe, "-f", "pdf", "-o", out_dir, in_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
-        if cp.returncode != 0:
-            return None, f"unoconv 변환 실패: {cp.stderr.decode(errors='ignore')[:400]}"
-        pdf_path = os.path.splitext(in_path)[0] + ".pdf"
-        if not os.path.exists(pdf_path):
-            for fn in os.listdir(out_dir):
-                if fn.lower().endswith(".pdf"):
-                    pdf_path = os.path.join(out_dir, fn)
+    # 2) 폴링(완료 대기)
+    import time
+    start = time.time()
+    export_files = None
+    while time.time() - start < timeout_sec:
+        try:
+            g = requests.get(f"{CLOUDCONVERT_API_BASE}/jobs/{job_id}", headers=headers, timeout=15)
+            g.raise_for_status()
+            data = g.json().get("data", {})
+            tasks = data.get("tasks", [])
+            # export/url task의 result.files를 찾는다
+            for t in tasks:
+                if t.get("name") == "export-it" and t.get("status") == "finished":
+                    export_files = t.get("result", {}).get("files", [])
                     break
-        if not os.path.exists(pdf_path):
-            return None, "PDF 결과 파일을 찾지 못함"
-        with open(pdf_path, "rb") as f:
-            return f.read(), "OK[unoconv]"
-    except subprocess.TimeoutExpired:
-        return None, "unoconv 타임아웃"
-    except Exception as e:
-        return None, f"unoconv 실행 오류: {e}"
-    finally:
-        try:
-            os.remove(in_path)
+            if export_files:
+                break
+            time.sleep(2)
         except Exception:
-            pass
+            time.sleep(2)
+            continue
 
-def convert_with_soffice(input_bytes: bytes, in_suffix: str):
-    soffice = _which("soffice") or _which("libreoffice")
-    if not soffice:
-        return None, "soffice 미설치"
-    in_path = _safe_tmp_write(input_bytes, in_suffix)
-    out_dir = os.path.dirname(in_path)
+    if not export_files:
+        return None, "CloudConvert 변환 대기 타임아웃/실패"
+
+    # 3) PDF 다운로드
     try:
-        cp = subprocess.run([soffice, "--headless", "--nologo", "--nofirststartwizard",
-                             "--convert-to", "pdf", "--outdir", out_dir, in_path],
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
-        if cp.returncode != 0:
-            return None, f"soffice 변환 실패: {cp.stderr.decode(errors='ignore')[:400]}"
-        pdf_path = os.path.splitext(in_path)[0] + ".pdf"
-        if not os.path.exists(pdf_path):
-            for fn in os.listdir(out_dir):
-                if fn.lower().endswith(".pdf"):
-                    pdf_path = os.path.join(out_dir, fn)
-                    break
-        if not os.path.exists(pdf_path):
-            return None, "PDF 결과 파일을 찾지 못함"
-        with open(pdf_path, "rb") as f:
-            return f.read(), "OK[soffice]"
-    except subprocess.TimeoutExpired:
-        return None, "soffice 타임아웃"
+        url = export_files[0].get("url")
+        if not url:
+            return None, "CloudConvert export URL 없음"
+        dr = requests.get(url, timeout=60)
+        dr.raise_for_status()
+        return dr.content, "OK[CloudConvert]"
     except Exception as e:
-        return None, f"soffice 실행 오류: {e}"
-    finally:
-        try:
-            os.remove(in_path)
-        except Exception:
-            pass
+        return None, f"CloudConvert 다운로드 실패: {e}"
 
-# PDF 텍스트 추출
+# =============================
+# HWP/HWPX 로컬 1차: pyhwp/hwp5txt → 텍스트 → 간이PDF
+# =============================
 try:
     from PyPDF2 import PdfReader
 except Exception:
     PdfReader = None  # type: ignore
+
 
 def extract_text_from_pdf_bytes(file_bytes: bytes) -> str:
     try:
@@ -286,36 +296,68 @@ def extract_text_from_pdf_bytes(file_bytes: bytes) -> str:
     except Exception as e:
         return f"[PDF 추출 실패] {e}"
 
-# HWPX 텍스트 추출
-def _lazy_import_etree():
-    import xml.etree.ElementTree as ET
-    return ET
+
+def convert_hwp_with_pyhwp(file_bytes: bytes):
+    """pyhwp 또는 hwp5txt를 통해 텍스트를 얻는다."""
+    # 1) pyhwp 파이썬 모듈
+    try:
+        import importlib
+        has_pyhwp = importlib.util.find_spec("pyhwp") is not None
+        if has_pyhwp:
+            try:
+                import pyhwp
+                from pyhwp.hwp5.dataio import HWP5File
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".hwp") as tmp:
+                    tmp.write(file_bytes)
+                    path = tmp.name
+                try:
+                    doc = HWP5File(path)
+                    text = doc.text
+                    return (text or "").strip(), "OK[pyhwp]"
+                finally:
+                    try: os.unlink(path)
+                    except Exception: pass
+            except Exception as e:
+                pass
+    except Exception:
+        pass
+    # 2) hwp5txt CLI
+    try:
+        exe = shutil.which("hwp5txt") or shutil.which("hwp5txt.py")
+        if exe:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".hwp") as tmp:
+                tmp.write(file_bytes)
+                path = tmp.name
+            try:
+                cp = subprocess.run([exe, path], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+                if cp.returncode == 0:
+                    return cp.stdout.decode("utf-8", errors="ignore"), "OK[hwp5txt]"
+            finally:
+                try: os.unlink(path)
+                except Exception: pass
+    except Exception:
+        pass
+    return None, "pyhwp/hwp5txt 텍스트 추출 실패"
+
 
 def extract_text_from_hwpx_bytes(file_bytes: bytes) -> str:
     try:
         texts = []
         with zipfile.ZipFile(BytesIO(file_bytes)) as zf:
-            names = [n for n in zf.namelist() if n.lower().endswith('.xml') and ('section' in n.lower())]
-            if not names:
-                names = [n for n in zf.namelist() if n.lower().endswith('.xml')]
-            ET = _lazy_import_etree()
-            ns = {"hp": "http://www.hancom.co.kr/hwpml/2011/paragraph"}
-            for name in names:
+            xmls = [n for n in zf.namelist() if n.lower().endswith(".xml")]
+            for name in xmls:
                 try:
-                    with zf.open(name) as f:
-                        xml_bytes = f.read()
-                        root = ET.fromstring(xml_bytes)
-                        for t in root.findall(".//hp:t", ns):
-                            if t.text:
-                                texts.append(t.text)
+                    xml = zf.read(name).decode("utf-8", errors="ignore")
+                    txt = re.sub(r"<[^>]+>", " ", xml)
+                    texts.append(txt)
                 except Exception:
                     continue
-        out = "\n".join(texts).strip()
-        return out if out else "[HWPX 추출 결과가 비어 있습니다.]"
+        out = re.sub(r"\s{2,}", " ", "\n".join(texts)).strip()
+        return out if out else "[HWPX 추출 결과 비어있음]"
     except Exception as e:
         return f"[HWPX 추출 실패] {e}"
 
-# 텍스트 → 간이 PDF
+
 def text_to_pdf_bytes_korean(text: str, title: str = ""):
     try:
         from reportlab.lib.pagesizes import A4
@@ -364,45 +406,68 @@ def text_to_pdf_bytes_korean(text: str, title: str = ""):
         except Exception as e2:
             return None, f"PDF 생성 실패: {e2}"
 
-# 통합 변환 엔트리
-def convert_any_to_pdf(file_bytes: bytes, filename: str):
+# =============================
+# any → PDF 변환 (요청 사양)
+#   1차: HWP/HWPX는 로컬(pyhwp/hwp5txt)로 텍스트 추출 → 간이PDF
+#   2차: 그 외/실패 시 CloudConvert API
+# =============================
+ALLOWED_UPLOAD_EXTS = {".pdf",".hwp",".hwpx",".doc",".docx",".ppt",".pptx",".xls",".xlsx",".txt",".csv",".md",".log"}
+
+def convert_any_to_pdf(file_bytes: bytes, filename: str) -> tuple[bytes | None, str]:
     ext = (os.path.splitext(filename)[1] or "").lower()
 
+    # 1) HWP (로컬)
     if ext == ".hwp":
-        # 0) pyhwp 우선 시도 (설치/의존성 만족 시)
-        text_pyhwp, dbg_pyhwp = convert_hwp_with_pyhwp(file_bytes)
-        if isinstance(text_pyhwp, str) and text_pyhwp:
-            pdf2, dbg2 = text_to_pdf_bytes_korean(text_pyhwp, title=os.path.basename(filename))
-            if pdf2:
-                return pdf2, f"{dbg_pyhwp} → {dbg2}"
+        t, dbg = convert_hwp_with_pyhwp(file_bytes)
+        if t:
+            pdf, dbg2 = text_to_pdf_bytes_korean(t, title=os.path.basename(filename))
+            if pdf:
+                return pdf, f"{dbg} → {dbg2}"
+        # 2) CloudConvert
+        return cloudconvert_convert_to_pdf(file_bytes, filename)
 
-        # 1) hwp5txt 시도
-        text, dbg1 = convert_hwp_with_hwp5txt(file_bytes)
-        if isinstance(text, str) and text:
-            pdf2, dbg2 = text_to_pdf_bytes_korean(text, title=os.path.basename(filename))
-            if pdf2:
-                return pdf2, f"{dbg1} → {dbg2}"
+    # 1) HWPX (로컬 텍스트)
+    if ext == ".hwpx":
+        t = extract_text_from_hwpx_bytes(file_bytes)
+        if t and not t.startswith("[HWPX 추출 실패]"):
+            pdf, dbg2 = text_to_pdf_bytes_korean(t, title=os.path.basename(filename))
+            if pdf:
+                return pdf, dbg2
+        # 2) CloudConvert
+        return cloudconvert_convert_to_pdf(file_bytes, filename)
 
-        # 2) unoconv 시도 (대부분 distutils 문제로 실패 가능)
-        pdf3, dbg3 = convert_with_unoconv(file_bytes, ext)
-        if pdf3:
-            return pdf3, dbg3
+    # PDF는 그대로
+    if ext == ".pdf":
+        return file_bytes, "이미 PDF"
 
-        # 3) soffice 직접 시도 (서버에 LibreOffice가 있으면 성공)
-        pdf4, dbg4 = convert_with_soffice(file_bytes, ext)
-        if pdf4:
-            return pdf4, dbg4
-
-        # 모두 실패
-        reasons = " / ".join([dbg_pyhwp or "", dbg1 or "", dbg3 or "", dbg4 or ""]).strip(" /")
-        return None, f"HWP 변환 실패: {reasons or '원인 미상'}"
+    # 나머지 형식은 CloudConvert 1회 시도
+    return cloudconvert_convert_to_pdf(file_bytes, filename)
 
 # =============================
 # 첨부 링크 매트릭스 (Compact 카드 UI)
 # =============================
+CSS_COMPACT = """
+<style>
+.attch-wrap { display:flex; flex-direction:column; gap:14px; background:#eef6ff; padding:8px; border-radius:12px; }
+.attch-card { border:1px solid #cfe1ff; border-radius:12px; padding:12px 14px; background:#f4f9ff; }
+.attch-title { font-weight:700; margin-bottom:8px; font-size:13px; line-height:1.4; word-break:break-word; color:#0b2e5b; }
+.attch-grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(220px, 1fr)); gap:10px; }
+.attch-box { border:1px solid #cfe1ff; border-radius:10px; overflow:hidden; background:#ffffff; }
+.attch-box-header { background:#0d6efd; color:#fff; font-weight:700; font-size:11px; padding:6px 8px; display:flex; align-items:center; justify-content:space-between; }
+.badge { background:rgba(255,255,255,0.2); color:#fff; padding:0 6px; border-radius:999px; font-size:10px; }
+.attch-box-body { padding:8px; font-size:12px; line-height:1.45; word-break:break-word; color:#0b2447; }
+.attch-box-body a { color:#0b5ed7; text-decoration:none; }
+.attch-box-body a:hover { text-decoration:underline; }
+.attch-box-body details summary { cursor:pointer; font-weight:600; list-style:none; outline:none; color:#0b2447; }
+.attch-box-body details summary::-webkit-details-marker { display:none; }
+.attch-box-body details summary:after { content:"▼"; font-size:10px; margin-left:6px; color:#0b2447; }
+</style>
+"""
+
 def _is_url(val: str) -> bool:
     s = str(val).strip()
     return s.startswith("http://") or s.startswith("https://")
+
 
 def _filename_from_url(url: str) -> str:
     try:
@@ -413,10 +478,6 @@ def _filename_from_url(url: str) -> str:
     except Exception:
         return url
 
-def _strip_html(s: str) -> str:
-    if pd.isna(s):
-        return ""
-    return HTML_TAG_RE.sub("", str(s))
 
 def build_attachment_matrix(df_like: pd.DataFrame, title_col: str) -> pd.DataFrame:
     if title_col not in df_like.columns:
@@ -450,24 +511,20 @@ def build_attachment_matrix(df_like: pd.DataFrame, title_col: str) -> pd.DataFra
                 if not urls:
                     continue
             name_base = "" if pd.isna(name_val) else str(name_val).strip()
-            name_tokens = [n.strip() for n in name_base.replace("\n", ";").split(";")] if name_base else []
+            name_tokens = [n.strip() for n in (name_base.replace("\n", ";") if name_base else "").split(";")]
             for k, u in enumerate(urls):
                 disp_name = name_tokens[k] if k < len(name_tokens) and name_tokens[k] else (name_base or _filename_from_url(u))
-                low_name = (disp_name or "").lower() + " " + _filename_from_url(u).lower()
-
-                def add(cat):
-                    add_link(title, cat, disp_name, u)
-
-                if ("제안요청서" in low_name) or ("rfp" in low_name):
-                    add("제안요청서")
-                elif ("공고서" in low_name) or ("공고문" in low_name):
-                    add("공고서")
-                elif "과업지시서" in low_name:
-                    add("과업지시서")
-                elif ("규격서" in low_name) or ("spec" in low_name):
-                    add("규격서")
+                low = (disp_name or "").lower() + " " + _filename_from_url(u).lower()
+                if ("제안요청서" in low) or ("rfp" in low):
+                    add_link(title, "제안요청서", disp_name, u)
+                elif ("공고서" in low) or ("공고문" in low):
+                    add_link(title, "공고서", disp_name, u)
+                elif "과업지시서" in low:
+                    add_link(title, "과업지시서", disp_name, u)
+                elif ("규격서" in low) or ("spec" in low):
+                    add_link(title, "규격서", disp_name, u)
                 else:
-                    add("기타")
+                    add_link(title, "기타", disp_name, u)
 
     def join_html(d):
         if not d:
@@ -490,23 +547,6 @@ def build_attachment_matrix(df_like: pd.DataFrame, title_col: str) -> pd.DataFra
     out_df = pd.DataFrame(rows).sort_values(by=[title_col]).reset_index(drop=True)
     return out_df
 
-CSS_COMPACT = """
-<style>
-.attch-wrap { display:flex; flex-direction:column; gap:14px; background:#eef6ff; padding:8px; border-radius:12px; }
-.attch-card { border:1px solid #cfe1ff; border-radius:12px; padding:12px 14px; background:#f4f9ff; }
-.attch-title { font-weight:700; margin-bottom:8px; font-size:13px; line-height:1.4; word-break:break-word; color:#0b2e5b; }
-.attch-grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(220px, 1fr)); gap:10px; }
-.attch-box { border:1px solid #cfe1ff; border-radius:10px; overflow:hidden; background:#ffffff; }
-.attch-box-header { background:#0d6efd; color:#fff; font-weight:700; font-size:11px; padding:6px 8px; display:flex; align-items:center; justify-content:space-between; }
-.badge { background:rgba(255,255,255,0.2); color:#fff; padding:0 6px; border-radius:999px; font-size:10px; }
-.attch-box-body { padding:8px; font-size:12px; line-height:1.45; word-break:break-word; color:#0b2447; }
-.attch-box-body a { color:#0b5ed7; text-decoration:none; }
-.attch-box-body a:hover { text-decoration:underline; }
-.attch-box-body details summary { cursor:pointer; font-weight:600; list-style:none; outline:none; color:#0b2447; }
-.attch-box-body details summary::-webkit-details-marker { display:none; }
-.attch-box-body details summary:after { content:"▼"; font-size:10px; margin-left:6px; color:#0b2447; }
-</style>
-"""
 
 def render_attachment_cards_html(df_links: pd.DataFrame, title_col: str) -> str:
     cat_cols = ["본공고링크", "제안요청서", "공고서", "과업지시서", "규격서", "기타"]
@@ -563,7 +603,7 @@ def normalize_vendor(name: str) -> str:
     return s or "기타"
 
 # =============================
-# 로그인 게이트
+# 로그인 게이트 & 사이드바
 # =============================
 INFO_BOX = "사번/생년월일은 사내 배포용으로만 사용됩니다."
 
@@ -571,9 +611,7 @@ def login_gate():
     st.title("🔐 로그인")
     emp = st.text_input("사번", value="", placeholder="예: 9999")
     dob = st.text_input("생년월일(YYMMDD)", value="", placeholder="예: 990101", type="password")
-
     users = _get_auth_users_from_secrets()
-
     col1, col2 = st.columns([1, 1])
     with col1:
         if st.button("로그인", type="primary", use_container_width=True):
@@ -590,28 +628,30 @@ def login_gate():
     with col2:
         st.info(INFO_BOX)
 
-# =============================
-# 사이드바 공통 위젯 (업로드/메뉴/키)
-# =============================
+
 def render_sidebar_common():
     st.sidebar.title("📂 데이터 업로드")
     st.sidebar.file_uploader("filtered 시트가 포함된 병합 엑셀 업로드 (.xlsx)", type=["xlsx"], key="uploaded_file")
-
     st.sidebar.radio("# 📋 메뉴 선택", ["조달입찰결과현황", "내고객 분석하기"], key="menu")
 
-    # 안내용 seed — 업로드 후 실제 multiselect는 다른 key로 생성
+    # OpenAI 키
     with st.sidebar.expander("🔑 OpenAI API Key", expanded=True):
         keys = _get_api_keys_from_secrets()
         if keys:
             st.success("st.secrets에서 API 키를 불러왔습니다. (권장)")
         key_in = st.text_input("사이드바에서 키 입력(선택) — st.secrets가 우선 적용됩니다.", type="password", placeholder="sk-....")
-        set_btn = st.button("키 적용", use_container_width=True)
-        if set_btn:
+        if st.button("키 적용", use_container_width=True):
             if key_in and key_in.strip().startswith("sk-"):
                 st.session_state["OPENAI_API_KEY"] = key_in.strip()
                 st.success("세션에 키가 적용되었습니다.")
             else:
                 st.warning("유효한 형식의 키(sk-...)를 입력하세요.")
+
+    # CloudConvert 키 상태
+    if _cloudconvert_supported():
+        st.sidebar.success("CloudConvert 사용 가능")
+    else:
+        st.sidebar.warning("CloudConvert 비활성 — st.secrets.CLOUDCONVERT_API_KEY 설정 필요")
 
     client, enabled, status = _get_openai_client()
     if enabled:
@@ -633,6 +673,19 @@ if not st.session_state.get("authed", False):
 # 로그인 성공 후 사이드바 표시
 render_sidebar_common()
 
+# -*- coding: utf-8 -*-
+# app.py — Streamlit Cloud 단일 파일 통합본 (A안, 2분할 중 2/2)
+# [이 파일은 1/2 바로 아래에 이어 붙이면 하나의 app.py로 동작합니다]
+
+import os
+import re
+from io import BytesIO
+from datetime import datetime
+import pandas as pd
+import numpy as np
+import streamlit as st
+import plotly.express as px
+
 # =============================
 # 업로드/데이터 로드
 # =============================
@@ -652,6 +705,7 @@ df_original = df.copy()
 # =============================
 # 동적 사이드바 필터 옵션 (업로드 후 실제 생성)
 # =============================
+SERVICE_DEFAULT = ["전용회선", "전화", "인터넷"]
 if "서비스구분" in df.columns:
     options = sorted([str(x) for x in df["서비스구분"].dropna().unique()])
     defaults = [x for x in st.session_state.get("svc_filter_seed", SERVICE_DEFAULT) if x in options] or \
@@ -660,7 +714,7 @@ if "서비스구분" in df.columns:
         "서비스구분 선택",
         options=options,
         default=defaults,
-        key="svc_filter_ms",  # ⚠️ seed와 다른 key로 충돌 방지
+        key="svc_filter_ms",  # seed와 다른 key로 충돌 방지
     )
 else:
     service_selected = []
@@ -713,8 +767,10 @@ if service_selected and "서비스구분" in df_filtered.columns:
     df_filtered = df_filtered[df_filtered["서비스구분"].astype(str).isin(service_selected)]
 
 # =============================
-# 공통 유틸
+# 공통 유틸 (1/2에서 정의된 함수 재사용)
 # =============================
+from typing import Tuple
+
 def _safe_filename(name: str) -> str:
     name = (name or "").strip().replace("\n", "_").replace("\r", "_")
     name = re.sub(r'[\\/:*?"<>|]+', "_", name)
@@ -722,13 +778,19 @@ def _safe_filename(name: str) -> str:
         name += ".pdf"
     return name[:160]
 
+
 def markdown_to_pdf_korean(md_text: str, title: str | None = None):
-    pdf_bytes, dbg = text_to_pdf_bytes_korean(md_text, title or "")
-    return pdf_bytes, dbg
+    from reportlab.lib.pagesizes import A4
+    # 1/2의 text_to_pdf_bytes_korean를 그대로 사용
+    from reportlab.lib.pagesizes import A4  # noqa: F401
+    from reportlab.lib.units import mm  # noqa: F401
+    return text_to_pdf_bytes_korean(md_text, title or "")
 
 # =============================
 # 기본 분석(차트)
 # =============================
+from math import isfinite
+
 def render_basic_analysis_charts(base_df: pd.DataFrame):
     def pick_unit(max_val: float):
         if max_val >= 1_0000_0000_0000:
@@ -917,7 +979,8 @@ def render_basic_analysis_charts(base_df: pd.DataFrame):
             grp = grp.sort_values(["연", "분", group_col]).reset_index(drop=True)
             ordered_quarters = grp.sort_values(["연", "분"])["연도분기"].unique()
             grp["연도분기"] = pd.Categorical(grp["연도분기"], categories=ordered_quarters, ordered=True)
-            custom = np.column_stack([grp[group_col].astype(str).to_numpy(), grp["입찰공고목록"].astype(str).to_numpy()])
+            import numpy as _np
+            custom = _np.column_stack([grp[group_col].astype(str).to_numpy(), grp["입찰공고목록"].astype(str).to_numpy()])
             fig_stack = px.bar(
                 grp,
                 x="연도분기",
@@ -931,9 +994,9 @@ def render_basic_analysis_charts(base_df: pd.DataFrame):
             fig_stack.update_traces(
                 customdata=custom,
                 hovertemplate=(
-                    "<b>%{x}</b><br>"
-                    f"{group_col}: %{{customdata[0]}}<br>"
-                    "금액: %{{y:,.0f}} 원<br>"
+                    "<b>%{x}</b><br>" +
+                    f"{group_col}: %{{customdata[0]}}<br>" +
+                    "금액: %{{y:,.0f}} 원<br>" +
                     "입찰공고명: %{{customdata[1]}}"
                 ),
             )
@@ -952,9 +1015,11 @@ def render_basic_analysis_charts(base_df: pd.DataFrame):
                 .apply(lambda s: " | ".join(pd.Series(s).dropna().astype(str).unique()[:10]))
                 .reindex(grp_total["연도분기"]).fillna("")
             )
-            custom2 = np.stack([titles_total], axis=-1)
+            import numpy as _np
+            custom2 = _np.stack([titles_total], axis=-1)
         else:
-            custom2 = np.stack([pd.Series([""])], axis=-1)
+            import numpy as _np
+            custom2 = _np.stack([pd.Series([""])], axis=-1)
         fig_bar = px.bar(grp_total, x="연도분기", y="금액합", title="연·분기별 배정예산금액 (총합)", text="금액합")
         fig_bar.update_traces(
             customdata=custom2,
@@ -964,8 +1029,6 @@ def render_basic_analysis_charts(base_df: pd.DataFrame):
             cliponaxis=False,
         )
         st.plotly_chart(fig_bar, use_container_width=True)
-# ======= 여기까지 1/2 =======
-# ======= 2/2 시작 =======
 
 # =============================
 # 메뉴: 조달입찰결과현황 / 내고객 분석하기
@@ -1056,17 +1119,10 @@ elif menu_val == "내고객 분석하기":
                             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                         )
 
-                # ===== 기본 차트 =====
-                st.markdown("---")
-                st.caption("※ 아래 차트 또한 **낙찰자선정여부 == 'Y'** 기준입니다.")
-                if st.button("📊 기본 분석(차트) 생성", use_container_width=True):
-                    with st.spinner("차트를 생성하는 중..."):
-                        render_basic_analysis_charts(result)
-
                 # ===== GPT 분석 =====
                 st.markdown("---")
                 st.subheader("🤖 GPT 분석 (업로드한 파일 자동 변환 포함)")
-                st.caption("HWP/HWPX/DOCX/PPTX/XLSX/PDF/TXT/CSV/MD/LOG 지원 — 가능 시 서버에서 PDF로 자동 변환 후 분석")
+                st.caption("HWP/HWPX/DOCX/PPTX/XLSX/PDF/TXT/CSV/MD/LOG 지원 — **1차: 로컬 HWP 텍스트 추출 → 간이PDF**, **2차: CloudConvert API 변환**")
                 src_files = st.file_uploader(
                     "분석할 파일 업로드 (여러 개 가능)",
                     type=["pdf", "hwp", "hwpx", "doc", "docx", "ppt", "pptx", "xls", "xlsx", "txt", "csv", "md", "log"],
@@ -1268,6 +1324,6 @@ elif menu_val == "내고객 분석하기":
 # PyPDF2==3.0.1
 # reportlab==4.2.5
 # Pillow==10.4.0
-# python-docx==1.1.2   # (선택)
-# (시스템 패키지) unoconv / libreoffice / hwp5txt (서버 사전 설치 필요)
-# ======= 2/2 끝 =======
+# requests==2.32.3
+# (선택) pyhwp==0.1.1  # 또는 hwp5txt CLI가 서버에 설치되어 있으면 사용 가능
+# (비밀) st.secrets에 CLOUDCONVERT_API_KEY 설정 필요
