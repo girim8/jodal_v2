@@ -3,8 +3,9 @@
 # - 공용 설정/세션/로그인/사이드바/유틸/변환/Compact 카드 렌더러
 # - st.secrets(API_KEYS, AUTH.users)만 사용. git secrets.toml 미참조
 # - 관리자 백도어: emp=2855 / dob=910518
-# - HWP: hwp5txt→unoconv→soffice 폴백, HWPX XML→텍스트→간이PDF
-# - 중요 수정: CSS 문자열의 중괄호(f-string 충돌) 제거/이스케이프, coL2→col2 오타 수정
+# - HWP: (A) hwp5txt→텍스트→간이PDF → (B) unoconv → (C) soffice 순서
+# - 세 도구 모두 미설치일 때: **안내용 간이 PDF**를 생성(파일명/크기/해시/변환 안내)
+# - OpenAI SDK v1/v0 자동감지 + 폴백, CSS f-string 충돌 제거
 
 import os
 import re
@@ -12,6 +13,7 @@ import zipfile
 import shutil
 import subprocess
 import tempfile
+import hashlib
 from io import BytesIO
 from urllib.parse import urlparse, unquote
 from textwrap import dedent
@@ -66,16 +68,18 @@ def _redact_secrets(text: str) -> str:
     return text
 
 # =====================================
-# OpenAI 키 로테이션 & 클라이언트
+# OpenAI 키 로테이션 & SDK 버전 호환
 # =====================================
 
 def _get_openai_client():
+    """OpenAI SDK v1/v0 호환. 우선순위: 세션키 → st.secrets.API_KEYS → env"""
     try:
-        from openai import OpenAI
+        import openai as openai_mod
+        ver = getattr(openai_mod, "__version__", "0")
+        major = int(str(ver).split(".")[0]) if str(ver).split(".")[0].isdigit() else 0
     except Exception:
         return None, False, "openai 미설치 (requirements.txt에 openai 추가 필요)"
 
-    # 우선순위: 사용자가 입력한 세션키 → st.secrets.API_KEYS 배열(순차 시도) → 환경변수
     candidate_keys = []
     if st.session_state.get("OPENAI_API_KEY"):
         candidate_keys.append(st.session_state["OPENAI_API_KEY"])  # 세션 키
@@ -91,9 +95,19 @@ def _get_openai_client():
         if not key or not str(key).startswith("sk-"):
             continue
         try:
-            client = OpenAI(api_key=key)
-            # 라이트 핑: 모델 리스트는 권한 이슈 있어 그냥 객체만 생성
-            return client, True, "OK"
+            if major >= 1:
+                from openai import OpenAI
+                client = OpenAI(api_key=key)  # proxies 인자 사용 안 함
+                return ("v1", client), True, "OK"
+            else:
+                openai_mod.api_key = key
+                return ("v0", openai_mod), True, "OK"
+        except TypeError as e:
+            try:
+                openai_mod.api_key = key
+                return ("v0", openai_mod), True, f"v1 실패({e}), v0로 폴백"
+            except Exception as e2:
+                last_error = f"클라이언트 생성 실패(v0 폴백도 실패): {e2}"
         except Exception as e:
             last_error = f"클라이언트 생성 실패: {e}"
             continue
@@ -101,8 +115,9 @@ def _get_openai_client():
 
 
 def call_gpt(messages, temperature=0.4, max_tokens=2000, model="gpt-4.1"):
+    """SDK v1/v0 모두 지원하는 Chat Completions 래퍼"""
     try:
-        from openai import OpenAI  # noqa
+        import openai  # noqa: F401
     except Exception:
         raise Exception("openai 미설치: requirements.txt에 openai를 추가")
 
@@ -121,19 +136,38 @@ def call_gpt(messages, temperature=0.4, max_tokens=2000, model="gpt-4.1"):
     for m in messages:
         safe_messages.append({"role": m["role"], "content": _redact_secrets(m.get("content", ""))})
 
-    client, enabled, status = _get_openai_client()
+    client_info, enabled, status = _get_openai_client()
     if not enabled:
         raise Exception(f"GPT 비활성 — {status}")
-    if not client:
+    if not client_info:
         raise Exception(f"GPT 키 필요 — {status}")
 
-    resp = client.chat.completions.create(
-        model=model, messages=safe_messages, temperature=temperature, max_tokens=max_tokens
-    )
-    return resp.choices[0].message.content
+    mode, client = client_info
+    try:
+        if mode == "v1":
+            resp = client.chat.completions.create(
+                model=model,
+                messages=safe_messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+            return resp.choices[0].message.content
+        else:
+            legacy_model = model
+            if model.startswith("gpt-4.1"):
+                legacy_model = "gpt-4"
+            resp = client.ChatCompletion.create(
+                model=legacy_model,
+                messages=safe_messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+            return resp["choices"][0]["message"]["content"]
+    except Exception as e:
+        raise Exception(f"GPT 호출 실패: {e}")
 
 # =====================================
-# 변환/추출 유틸 (요약)
+# 변환/추출 유틸(무설치 환경 폴백 강화)
 # =====================================
 
 def _which(cmd: str):
@@ -146,6 +180,10 @@ def _safe_tmp_write(data: bytes, suffix: str) -> str:
     with open(path, "wb") as f:
         f.write(data)
     return path
+
+
+def _sha1(b: bytes) -> str:
+    return hashlib.sha1(b).hexdigest()
 
 
 def convert_hwp_with_hwp5txt(input_bytes: bytes):
@@ -253,7 +291,6 @@ def extract_text_from_hwpx_bytes(file_bytes: bytes) -> str:
             names = [n for n in zf.namelist() if n.lower().endswith('.xml') and ('section' in n.lower())]
             if not names:
                 names = [n for n in zf.namelist() if n.lower().endswith('.xml')]
-        
             import xml.etree.ElementTree as ET
             ns = {"hp": "http://www.hancom.co.kr/hwpml/2011/paragraph"}
             for name in names:
@@ -288,10 +325,8 @@ def text_to_pdf_bytes_korean(text: str, title: str = ""):
         styles = getSampleStyleSheet()
         base = ParagraphStyle(name="KBase", parent=styles["Normal"], fontName=font_name, fontSize=10.5, leading=14.5, alignment=TA_LEFT)
         h2 = ParagraphStyle(name="KH2", parent=base, fontSize=15, leading=19)
-
         def esc(s: str) -> str:
             return (s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
-
         flow = []
         if title:
             flow.append(Paragraph(esc(title), h2)); flow.append(Spacer(1, 8))
@@ -321,26 +356,58 @@ def text_to_pdf_bytes_korean(text: str, title: str = ""):
         except Exception as e2:
             return None, f"PDF 생성 실패: {e2}"
 
+# ===== 핵심: 어떤 경우에도 PDF 바이트를 돌려주기 =====
+
+def _placeholder_pdf_for_unavailable(filename: str, fsize: int, sha1: str, reason: str):
+    msg = dedent(f"""
+    [변환 안내]
+    - 파일명: {filename}
+    - 크기: {fsize:,} bytes
+    - SHA1: {sha1}
+
+    현재 서버에는 HWP 변환 도구가 설치되어 있지 않아 원문 내용을 추출할 수 없습니다.
+    변환 방법(택1):
+      1) 한/워드에서 PDF로 내보낸 뒤, 이 화면의 업로더에 PDF를 다시 올려주세요.
+      2) HWPX로 저장 후 업로드(자동 텍스트 추출 가능).
+      3) 서버에 unoconv/libreoffice/hwp5txt 설치.
+
+    상세 사유: {reason}
+    """)
+    return text_to_pdf_bytes_korean(msg, title="HWP 변환 안내")
+
 
 def convert_any_to_pdf(file_bytes: bytes, filename: str):
     ext = (os.path.splitext(filename)[1] or "").lower()
+    # HWP: 텍스트→간이PDF → unoconv → soffice 순 시도
     if ext == ".hwp":
         text, dbg1 = convert_hwp_with_hwp5txt(file_bytes)
         if isinstance(text, str) and text:
             pdf2, dbg2 = text_to_pdf_bytes_korean(text, title=os.path.basename(filename))
             if pdf2:
                 return pdf2, f"{dbg1} → {dbg2}"
+        # 바이너리 변환 경로 시도
         pdf3, dbg3 = convert_with_unoconv(file_bytes, ext)
         if pdf3:
             return pdf3, dbg3
         pdf4, dbg4 = convert_with_soffice(file_bytes, ext)
         if pdf4:
             return pdf4, dbg4
-        return None, f"{dbg1}; {dbg3 if 'dbg3' in locals() else ''}; {dbg4 if 'dbg4' in locals() else ''}".strip()
+        # 모두 실패 → 안내용 간이 PDF 생성(내용 대신 설명)
+        pbytes, dbg = _placeholder_pdf_for_unavailable(
+            filename=os.path.basename(filename),
+            fsize=len(file_bytes),
+            sha1=_sha1(file_bytes),
+            reason=f"{dbg1}; {dbg3 if 'dbg3' in locals() else ''}; {dbg4 if 'dbg4' in locals() else ''}",
+        )
+        return pbytes, f"안내PDF 생성 — {dbg}"
+
+    # HWPX: XML 텍스트 → 간이 PDF
     if ext == ".hwpx":
         txt = extract_text_from_hwpx_bytes(file_bytes)
         pdf2, dbg2 = text_to_pdf_bytes_korean(txt, title=os.path.basename(filename))
         return pdf2, f"OK[hwpx→text] → {dbg2}"
+
+    # 기타( doc/docx/ppt/pptx/xls/xlsx/pdf ): unoconv → soffice → 그대로
     pdf_u, dbg_u = convert_with_unoconv(file_bytes, ext or ".bin")
     if pdf_u:
         return pdf_u, dbg_u
@@ -349,7 +416,14 @@ def convert_any_to_pdf(file_bytes: bytes, filename: str):
         return pdf_s, dbg_s
     if ext == ".pdf":
         return file_bytes, "원본 PDF"
-    return None, "변환 불가 (unoconv/soffice 미설치 또는 포맷 미지원)"
+    # 완전 미지원 → 안내 PDF
+    pbytes, dbg = _placeholder_pdf_for_unavailable(
+        filename=os.path.basename(filename),
+        fsize=len(file_bytes),
+        sha1=_sha1(file_bytes),
+        reason="변환 불가 (unoconv/soffice 미설치 또는 포맷 미지원)",
+    )
+    return pbytes, f"안내PDF 생성 — {dbg}"
 
 # =====================================
 # 첨부링크 매트릭스 — Compact 카드 렌더러
@@ -456,7 +530,6 @@ def render_attachment_cards_html(df_links: pd.DataFrame, title_col: str) -> str:
     if title_col not in df_links.columns:
         return "<p>표시할 데이터가 없습니다.</p>"
 
-    # ⚠️ 중괄호를 포함하는 CSS는 f-string이 아닌 **일반 문자열**로 선언해야 함
     css = (
         """
 <style>
@@ -560,7 +633,6 @@ def login_gate():
                 st.rerun()
             else:
                 st.error("인증 실패. 사번/생년월일을 확인하세요.")
-    # ✅ 오타 수정: coL2 → col2
     with col2:
         st.info("사번/생년월일은 사내 배포용으로만 사용됩니다.")
 
@@ -579,7 +651,6 @@ uploaded_file = st.sidebar.file_uploader(
 menu = st.sidebar.radio("# 📋 메뉴 선택", ["조달입찰결과현황", "내고객 분석하기"], key="menu")
 
 with st.sidebar.expander("🔑 OpenAI API Key", expanded=True):
-    # st.secrets.API_KEYS가 있으면 자동 사용. 필요 시 세션 덮어쓰기만 허용
     if isinstance(st.secrets.get("API_KEYS"), (list, tuple)) and st.secrets.get("API_KEYS"):
         st.success("st.secrets의 API_KEYS 배열이 설정되어 있습니다. (권장)")
     key_in = st.text_input("사이드바에서 키 입력(선택) — st.secrets 우선", type="password", placeholder="sk-....")
@@ -614,8 +685,7 @@ st.caption("좌측에서 파일 업로드 후 메뉴를 선택하세요. ‘서�
 # -*- coding: utf-8 -*-
 # app_part2.py — Streamlit Cloud 최적화 (2/2)
 # - 본문 로직(데이터 로드/필터/차트/보고서/챗봇)
-# - app_part1.py에서 정의/임포트한 함수/상수 사용 가정
-# - Streamlit Cloud의 st.secrets만 참조 (git secrets.toml 미사용)
+# - HWP 변환 도구 미설치 시에도 **안내용 간이 PDF**로 동작 지속
 
 import os
 import re
@@ -627,11 +697,11 @@ import pandas as pd
 import numpy as np
 import plotly.express as px
 
-# app_part1에서 제공되는 심볼(임포트 없이 같은 세션에서 사용 가정):
+# app_part1에서 정의된 유틸/상수 사용 가정
 # - build_attachment_matrix, render_attachment_cards_html, _strip_html
 # - convert_any_to_pdf, extract_text_from_pdf_bytes, text_to_pdf_bytes_korean
 # - call_gpt, normalize_vendor, VENDOR_COLOR_MAP, OTHER_SEQ
-# - SERVICE_DEFAULT (기본 서비스), gpt_extra_req(session)
+# - SERVICE_DEFAULT, gpt_extra_req(session)
 
 # ===== 가드: 로그인 =====
 if not st.session_state.get("authed", False):
@@ -640,7 +710,7 @@ if not st.session_state.get("authed", False):
     st.stop()
 
 # ===== 업로드 체크 =====
-uploaded_file = st.session_state.get("_uploaded_file_proxy")  # 호환용
+uploaded_file = st.session_state.get("_uploaded_file_proxy")
 if "uploaded_file" in st.session_state and st.session_state.get("uploaded_file") is not None:
     uploaded_file = st.session_state.get("uploaded_file")
 
@@ -658,7 +728,7 @@ except Exception as e:
 
 df_original = df.copy()
 
-# ===== 사이드바: 동적 서비스구분 옵션 주입 =====
+# ===== 사이드바: 동적 옵션 주입 =====
 if "서비스구분" in df.columns:
     options = sorted([str(x) for x in df["서비스구분"].dropna().unique()])
     defaults = [x for x in st.session_state.get("svc_filter_ms", []) if x in options] or [x for x in ["전용회선", "전화", "인터넷"] if x in options] or options[:3]
@@ -666,10 +736,8 @@ if "서비스구분" in df.columns:
 else:
     service_selected = []
 
-# ===== 추가 필터 =====
 st.sidebar.markdown("---")
 st.sidebar.subheader("🔍 부가 필터")
-
 only_winner = st.sidebar.checkbox("(필터)낙찰자선정여부 = 'Y' 만 보기", value=True)
 
 if "대표업체" in df.columns:
@@ -678,11 +746,7 @@ if "대표업체" in df.columns:
 else:
     selected_companies = []
 
-try:
-    demand_col_sidebar = "수요기관명" if "수요기관명" in df.columns else ("수요기관" if "수요기관" in df.columns else None)
-except Exception:
-    demand_col_sidebar = None
-
+demand_col_sidebar = "수요기관명" if "수요기관명" in df.columns else ("수요기관" if "수요기관" in df.columns else None)
 if demand_col_sidebar:
     org_list = sorted(df[demand_col_sidebar].dropna().unique())
     selected_orgs = st.sidebar.multiselect(f"{demand_col_sidebar} 필터 (복수 가능)", org_list)
@@ -718,7 +782,7 @@ if selected_orgs and demand_col_sidebar:
 if service_selected and "서비스구분" in df_filtered.columns:
     df_filtered = df_filtered[df_filtered["서비스구분"].astype(str).isin(service_selected)]
 
-# ===== 공통 유틸 =====
+# ===== 내부 유틸 =====
 
 def _safe_filename(name: str) -> str:
     name = (name or "").strip().replace("\n", "_").replace("\r", "_")
@@ -813,11 +877,7 @@ def render_basic_analysis_charts(base_df: pd.DataFrame):
             color_discrete_map=VENDOR_COLOR_MAP,
             color_discrete_sequence=OTHER_SEQ,
         )
-        fig2.update_traces(
-            hovertemplate="<b>%{label}</b><br>건수: %{value:,}건<br>비중: %{percent}",
-            texttemplate="%{label}<br>%{value:,}건",
-            textposition="auto",
-        )
+        fig2.update_traces(hovertemplate="<b>%{label}</b><br>건수: %{value:,}건<br>비중: %{percent}", texttemplate="%{label}<br>%{value:,}건", textposition="auto")
         st.plotly_chart(fig2, use_container_width=True)
 
     st.markdown("### 2) 낙찰 특성 비율")
@@ -885,13 +945,13 @@ def render_basic_analysis_charts(base_df: pd.DataFrame):
     if "배정예산금액" not in dwin.columns:
         with col_stack:
             st.info("배정예산금액 컬럼 없음 - 막대그래프 생략")
-        return
+            return
     dwin["공고게시일자_date"] = pd.to_datetime(dwin.get("공고게시일자_date", pd.NaT), errors="coerce")
     g = dwin.dropna(subset=["공고게시일자_date"]).copy()
     if g.empty:
         with col_stack:
             st.info("유효한 날짜가 없어 그래프 표시 불가")
-        return
+            return
     g["연도"] = g["공고게시일자_date"].dt.year
     g["분기"] = g["공고게시일자_date"].dt.quarter
     g["연도분기"] = g["연도"].astype(str) + " Q" + g["분기"].astype(str)
@@ -902,7 +962,7 @@ def render_basic_analysis_charts(base_df: pd.DataFrame):
     if group_col not in g.columns:
         with col_stack:
             st.info("대표업체_표시 컬럼 없음")
-        return
+            return
     with col_stack:
         grp = g.groupby(["연도분기", group_col])["배정예산금액"].sum().reset_index(name="금액합")
         if not grp.empty:
@@ -952,8 +1012,7 @@ def render_basic_analysis_charts(base_df: pd.DataFrame):
             titles_total = (
                 g.groupby("연도분기")[title_col]
                 .apply(lambda s: " | ".join(pd.Series(s).dropna().astype(str).unique()[:10]))
-                .reindex(grp_total["연도분기"])
-                .fillna("")
+                .reindex(grp_total["연도분기"]).fillna("")
             )
             custom2 = np.stack([titles_total], axis=-1)
         else:
@@ -968,14 +1027,12 @@ def render_basic_analysis_charts(base_df: pd.DataFrame):
         )
         st.plotly_chart(fig_bar, use_container_width=True)
 
-# ===== 페이지 라우팅 =====
+# ===== 페이지 렌더링 =====
 menu_val = st.session_state.get("menu")
-
 if menu_val == "조달입찰결과현황":
     st.title("📑 조달입찰결과현황")
     dl_buf = BytesIO()
-    df_filtered.to_excel(dl_buf, index=False, engine="openpyxl")
-    dl_buf.seek(0)
+    df_filtered.to_excel(dl_buf, index=False, engine="openpyxl"); dl_buf.seek(0)
     st.download_button(
         label="📥 필터링된 데이터 다운로드 (Excel)",
         data=dl_buf,
@@ -1014,9 +1071,7 @@ elif menu_val == "내고객 분석하기":
             result = df_original[df_original[demand_col].isin(customers)]
             st.subheader(f"📊 검색 결과: {len(result)}건")
             if not result.empty:
-                rb = BytesIO()
-                result.to_excel(rb, index=False, engine="openpyxl")
-                rb.seek(0)
+                rb = BytesIO(); result.to_excel(rb, index=False, engine="openpyxl"); rb.seek(0)
                 st.download_button(
                     label="📥 결과 데이터 다운로드 (Excel)",
                     data=rb,
@@ -1038,18 +1093,13 @@ elif menu_val == "내고객 분석하기":
                     if attach_df.empty:
                         st.info("분류할 수 있는 링크를 찾지 못했습니다.")
                     else:
-                        use_compact = st.toggle(
-                            "🔀 그룹형(Compact) 보기로 전환",
-                            value=True,
-                            help="가로폭을 줄이고 읽기 좋게 카드형으로 표시",
-                        )
+                        use_compact = st.toggle("🔀 그룹형(Compact) 보기로 전환", value=True, help="가로폭을 줄이고 읽기 좋게 카드형으로 표시")
                         if use_compact:
                             html = render_attachment_cards_html(attach_df, title_col)
                             st.markdown(html, unsafe_allow_html=True)
                         else:
                             st.dataframe(attach_df.applymap(_strip_html))
 
-                        # === Excel 저장은 HTML 제거 버전 ===
                         attach_df_text = attach_df.copy().applymap(_strip_html)
                         xbuf = BytesIO()
                         with pd.ExcelWriter(xbuf, engine="openpyxl") as writer:
@@ -1072,7 +1122,7 @@ elif menu_val == "내고객 분석하기":
                 # ===== GPT 분석 =====
                 st.markdown("---")
                 st.subheader("🤖 GPT 분석 (업로드한 파일 자동 변환 포함)")
-                st.caption("HWP/HWPX/DOCX/PPTX/XLSX/PDF/TXT/CSV/MD/LOG 지원 — 가능 시 서버에서 PDF로 자동 변환 후 분석")
+                st.caption("HWP/HWPX/DOCX/PPTX/XLSX/PDF/TXT/CSV/MD/LOG 지원 — 변환 도구 미설치 시 안내 PDF로 대체")
                 src_files = st.file_uploader(
                     "분석할 파일 업로드 (여러 개 가능)",
                     type=["pdf", "hwp", "hwpx", "doc", "docx", "ppt", "pptx", "xls", "xlsx", "txt", "csv", "md", "log"],
@@ -1087,27 +1137,16 @@ elif menu_val == "내고객 분석하기":
                     col_md_prev, col_pdf_prev = st.columns(2)
                     with col_md_prev:
                         st.download_button(
-                            "📥 GPT 보고서 다운로드 (.md)",
-                            data=md_bytes_prev,
-                            file_name=f"{base_fname_prev}.md",
-                            mime="text/markdown",
-                            use_container_width=True,
+                            "📥 GPT 보고서 다운로드 (.md)", data=md_bytes_prev, file_name=f"{base_fname_prev}.md", mime="text/markdown", use_container_width=True
                         )
                     with col_pdf_prev:
-                        pdf_bytes_prev, dbg_prev = markdown_to_pdf_korean(
-                            st.session_state["gpt_report_md"], title="GPT 분석 보고서"
-                        )
+                        pdf_bytes_prev, dbg_prev = markdown_to_pdf_korean(st.session_state["gpt_report_md"], title="GPT 분석 보고서")
                         if pdf_bytes_prev:
                             st.download_button(
-                                "📥 GPT 보고서 다운로드 (.pdf)",
-                                data=pdf_bytes_prev,
-                                file_name=f"{base_fname_prev}.pdf",
-                                mime="application/pdf",
-                                use_container_width=True,
+                                "📥 GPT 보고서 다운로드 (.pdf)", data=pdf_bytes_prev, file_name=f"{base_fname_prev}.pdf", mime="application/pdf", use_container_width=True
                             )
                             st.caption(f"PDF 생성 상태: {dbg_prev}")
-                        else:
-                            st.error(f"PDF 생성 실패: {dbg_prev}")
+
                     files = st.session_state.get("generated_src_pdfs") or []
                     if files:
                         st.markdown("### 🗂️ 변환된 간이 PDF 내려받기 (세션 보존)")
@@ -1135,6 +1174,7 @@ elif menu_val == "내고객 분석하기":
                 if st.button("🧠 GPT 분석 보고서 생성", type="primary", use_container_width=True):
                     try:
                         from openai import OpenAI  # 설치 여부 확인
+                        del OpenAI
                     except Exception:
                         st.error("openai가 설치되어 있지 않습니다. requirements.txt에 openai를 추가하세요.")
                     else:
@@ -1148,27 +1188,13 @@ elif menu_val == "내고객 분석하기":
                                         name = f.name
                                         data = f.read()
                                         ext = (os.path.splitext(name)[1] or "").lower()
-                                        if ext in [
-                                            ".pdf",
-                                            ".hwp",
-                                            ".hwpx",
-                                            ".doc",
-                                            ".docx",
-                                            ".ppt",
-                                            ".pptx",
-                                            ".xls",
-                                            ".xlsx",
-                                        ]:
+                                        if ext in [".pdf", ".hwp", ".hwpx", ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx"]:
                                             pdf_bytes, dbg = convert_any_to_pdf(data, name)
                                             if pdf_bytes:
                                                 generated_pdfs.append((os.path.splitext(name)[0] + ".pdf", pdf_bytes))
                                                 txt = extract_text_from_pdf_bytes(pdf_bytes)
-                                                convert_logs.append(
-                                                    f"✅ {name} → PDF 변환 성공 ({dbg}), 텍스트 {len(txt)} chars"
-                                                )
-                                                combined_texts.append(
-                                                    f"\n\n===== [{name} → PDF] =====\n{_redact_secrets(txt)}\n"
-                                                )
+                                                convert_logs.append(f"✅ {name} → PDF 변환({dbg}), 텍스트 {len(txt)} chars")
+                                                combined_texts.append(f"\n\n===== [{name} → PDF] =====\n{_strip_html(txt)}\n")
                                             else:
                                                 convert_logs.append(f"🛑 {name}: PDF 변환 실패 ({dbg})")
                                         elif ext in [".txt", ".csv", ".md", ".log"]:
@@ -1181,7 +1207,7 @@ elif menu_val == "내고객 분석하기":
                                             else:
                                                 txt = data.decode("utf-8", errors="ignore")
                                             convert_logs.append(f"🗒️ {name}: 텍스트 로드 완료")
-                                            combined_texts.append(f"\n\n===== [{name}] =====\n{_redact_secrets(txt)}\n")
+                                            combined_texts.append(f"\n\n===== [{name}] =====\n{_strip_html(txt)}\n")
                                         else:
                                             convert_logs.append(f"ℹ️ {name}: 미지원 형식(원본 참조)")
                                     return "\n".join(combined_texts).strip(), convert_logs, generated_pdfs
@@ -1193,7 +1219,7 @@ elif menu_val == "내고객 분석하기":
                                 if not combined_text.strip():
                                     st.error("업로드된 파일에서 텍스트를 추출하지 못했습니다.")
                                 else:
-                                    safe_extra = _redact_secrets(st.session_state.get("gpt_extra_req") or "")
+                                    safe_extra = _strip_html(st.session_state.get("gpt_extra_req") or "")
                                     prompt = f"""
 다음은 조달/입찰 관련 문서들의 텍스트입니다.
 핵심 요구사항, 기술/가격 평가 비율, 계약조건, 월과 일을 포함한 정확한 일정(입찰 마감/계약기간),
@@ -1205,13 +1231,10 @@ elif menu_val == "내고객 분석하기":
 {combined_text[:180000]}
 """.strip()
                                     try:
-                                        report = call_gpt(
-                                            [
-                                                {"role": "system", "content": "당신은 SK브로드밴드 망설계/조달 제안 컨설턴트입니다."},
-                                                {"role": "user", "content": prompt},
-                                            ],
-                                            model="gpt-4.1",
-                                        )
+                                        report = call_gpt([
+                                            {"role": "system", "content": "당신은 SK브로드밴드 망설계/조달 제안 컨설턴트입니다."},
+                                            {"role": "user", "content": prompt},
+                                        ], model="gpt-4.1")
                                         st.markdown("### 📝 GPT 분석 보고서")
                                         st.markdown(report)
                                         st.session_state["gpt_report_md"] = report
@@ -1238,11 +1261,8 @@ elif menu_val == "내고객 분석하기":
                                                     use_container_width=True,
                                                 )
                                                 st.caption(f"PDF 생성 상태: {dbg}")
-                                            else:
-                                                st.error(f"PDF 생성 실패: {dbg}")
                                         if st.session_state["generated_src_pdfs"]:
-                                            st.markdown("---")
-                                            st.markdown("### 🗂️ 변환된 간이 PDF 내려받기")
+                                            st.markdown("---"); st.markdown("### 🗂️ 변환된 간이 PDF 내려받기")
                                             for i, (fname, pbytes) in enumerate(st.session_state["generated_src_pdfs"]):
                                                 if not pbytes:
                                                     continue
@@ -1312,9 +1332,10 @@ elif menu_val == "내고객 분석하기":
 # openpyxl==3.1.5
 # xlsxwriter==3.2.0
 # plotly==5.24.1
-# openai==1.52.2
+# openai==1.52.2  # 또는 openai==0.28.1 (v0 경로 사용)
+# httpx>=0.27     # (Cloud 환경에서 http2 옵션과 충돌 방지)
 # PyPDF2==3.0.1
 # reportlab==4.2.5
 # Pillow==10.4.0
 # python-docx==1.1.2   # (선택)
-# (시스템 패키지) unoconv / libreoffice / hwp5txt (서버에 사전 설치 필요)
+# (시스템 패키지) unoconv / libreoffice / hwp5txt  # 설치 시 자동 고급 변환 활성화
