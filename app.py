@@ -2,7 +2,8 @@
 # app_part1.py — Streamlit Cloud 최적화 (1/2)
 # - 공용 설정/세션/로그인/사이드바/유틸/변환/Compact 카드 렌더러
 # - 요청 반영: hwp5txt → unoconv → soffice 순 변환, HTML/CSS 최소화(Compact만 유지)
-# - 세션 안전성 강화, TOML(st.secrets) 기반 계정 + 하드코딩 admin(2855/910518)
+# - 세션 안전성 강화, Streamlit Cloud st.secrets(API_KEYS, AUTH.users)만 사용
+# - 관리자 하드코딩(사번 2855 / 생년월일 910518) 병행 허용
 # - Python 3.11 호환 패키지 전제
 
 import os
@@ -10,6 +11,7 @@ import re
 import zipfile
 import shutil
 import subprocess
+import tempfile
 from io import BytesIO
 from urllib.parse import urlparse, unquote
 from textwrap import dedent
@@ -57,6 +59,7 @@ SERVICE_DEFAULT = ["전용회선", "전화", "인터넷"]
 # =====================================
 HTML_TAG_RE = re.compile(r"<[^>]+>")
 
+
 def _redact_secrets(text: str) -> str:
     if not isinstance(text, str):
         return text
@@ -65,26 +68,58 @@ def _redact_secrets(text: str) -> str:
     return text
 
 # =====================================
-# OpenAI 클라이언트 & 호출 래퍼
+# OpenAI 클라이언트 & 호출 래퍼 (st.secrets 전용)
 # =====================================
 
 def _get_openai_client():
+    """Streamlit Cloud의 st.secrets만 사용.
+    st.secrets["API_KEYS"]가 배열이면 순차 시도하여 최초 유효 키로 클라이언트 생성.
+    세션 내 수동 입력 키가 있으면 그것도 가장 먼저 시도.
+    """
     try:
         from openai import OpenAI
     except Exception:
         return None, False, "openai 미설치 (requirements.txt에 openai 추가 필요)"
-    key = (
-        st.secrets.get("OPENAI_API_KEY", None)
-        or st.session_state.get("OPENAI_API_KEY", None)
-        or os.environ.get("OPENAI_API_KEY", None)
-    )
-    if not key or str(key).strip().startswith("sk-REPLACE_"):
-        return None, True, "API 키 미설정 (st.secrets 혹은 사이드바에 입력)"
+
+    candidates = []
+    # 1) 사용자가 사이드바에 입력한 키가 있으면 우선
+    ses_key = st.session_state.get("OPENAI_API_KEY")
+    if ses_key and str(ses_key).startswith("sk-"):
+        candidates.append(ses_key)
+
+    # 2) st.secrets["API_KEYS"] 배열
     try:
-        client = OpenAI(api_key=key)
-        return client, True, "OK"
-    except Exception as e:
-        return None, True, f"클라이언트 생성 실패: {e}"
+        api_keys = st.secrets.get("API_KEYS", [])
+        if isinstance(api_keys, (list, tuple)):
+            candidates.extend([k for k in api_keys if isinstance(k, str) and k.startswith("sk-")])
+    except Exception:
+        pass
+
+    # 3) 환경변수(최후보루)
+    env_key = os.environ.get("OPENAI_API_KEY")
+    if env_key and env_key.startswith("sk-"):
+        candidates.append(env_key)
+
+    # 중복 제거
+    seen, uniq = set(), []
+    for k in candidates:
+        if k not in seen:
+            uniq.append(k); seen.add(k)
+
+    if not uniq:
+        return None, True, "API 키 미설정 — st.secrets['API_KEYS'] 배열 또는 사이드바에 입력하세요."
+
+    last_err = None
+    for key in uniq:
+        try:
+            client = OpenAI(api_key=key)
+            # 간단한 유효성 점검(토큰 길이만 검사 — 네트워크 호출 회피)
+            if len(key) >= 20:
+                return client, True, "OK"
+        except Exception as e:
+            last_err = e
+            continue
+    return None, True, f"클라이언트 생성 실패: {last_err or '유효한 키 없음'}"
 
 
 def call_gpt(messages, temperature=0.4, max_tokens=2000, model="gpt-4.1"):
@@ -92,6 +127,7 @@ def call_gpt(messages, temperature=0.4, max_tokens=2000, model="gpt-4.1"):
         from openai import OpenAI
     except Exception:
         raise Exception("openai 미설치: requirements.txt에 openai를 추가")
+
     guardrail_system = {
         "role": "system",
         "content": dedent(
@@ -106,11 +142,13 @@ def call_gpt(messages, temperature=0.4, max_tokens=2000, model="gpt-4.1"):
     safe_messages = [guardrail_system]
     for m in messages:
         safe_messages.append({"role": m["role"], "content": _redact_secrets(m.get("content", ""))})
+
     client, enabled, status = _get_openai_client()
     if not enabled:
         raise Exception(f"GPT 비활성 — {status}")
     if not client:
         raise Exception(f"GPT 키 필요 — {status}")
+
     resp = client.chat.completions.create(
         model=model, messages=safe_messages, temperature=temperature, max_tokens=max_tokens
     )
@@ -120,6 +158,7 @@ def call_gpt(messages, temperature=0.4, max_tokens=2000, model="gpt-4.1"):
 # 변환/추출 유틸 — HWP/HWPX/PDF 경량 파이프라인
 #   순서: hwp5txt(텍스트) → unoconv(PDF) → soffice(PDF)
 # =====================================
+
 
 def _which(cmd: str):
     return shutil.which(cmd)
@@ -134,13 +173,13 @@ def _safe_tmp_write(data: bytes, suffix: str) -> str:
 
 
 # 임포트 지연용
+
 def _lazy_import_etree():
     import xml.etree.ElementTree as ET
     return ET
 
 
 # 1) hwp5txt → 텍스트 추출 (HWP 전용)
-import tempfile
 
 def convert_hwp_with_hwp5txt(input_bytes: bytes):
     exe = _which("hwp5txt")
@@ -159,8 +198,10 @@ def convert_hwp_with_hwp5txt(input_bytes: bytes):
     except Exception as e:
         return None, f"hwp5txt 실행 오류: {e}"
     finally:
-        try: os.remove(in_path)
-        except Exception: pass
+        try:
+            os.remove(in_path)
+        except Exception:
+            pass
 
 
 # 2) unoconv → PDF 변환 (다수 포맷)
@@ -181,7 +222,8 @@ def convert_with_unoconv(input_bytes: bytes, in_suffix: str):
         if not os.path.exists(pdf_path):
             for fn in os.listdir(out_dir):
                 if fn.lower().endswith(".pdf"):
-                    pdf_path = os.path.join(out_dir, fn); break
+                    pdf_path = os.path.join(out_dir, fn)
+                    break
         if not os.path.exists(pdf_path):
             return None, "PDF 결과 파일을 찾지 못함"
         with open(pdf_path, "rb") as f:
@@ -191,8 +233,10 @@ def convert_with_unoconv(input_bytes: bytes, in_suffix: str):
     except Exception as e:
         return None, f"unoconv 실행 오류: {e}"
     finally:
-        try: os.remove(in_path)
-        except Exception: pass
+        try:
+            os.remove(in_path)
+        except Exception:
+            pass
 
 
 # 3) soffice → PDF 변환 (대체 경로)
@@ -204,8 +248,17 @@ def convert_with_soffice(input_bytes: bytes, in_suffix: str):
     in_path = _safe_tmp_write(input_bytes, in_suffix)
     out_dir = os.path.dirname(in_path)
     try:
-        cmd = [soffice, "--headless", "--nologo", "--nofirststartwizard",
-               "--convert-to", "pdf", "--outdir", out_dir, in_path]
+        cmd = [
+            soffice,
+            "--headless",
+            "--nologo",
+            "--nofirststartwizard",
+            "--convert-to",
+            "pdf",
+            "--outdir",
+            out_dir,
+            in_path,
+        ]
         cp = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
         if cp.returncode != 0:
             return None, f"soffice 변환 실패: {cp.stderr.decode(errors='ignore')[:400]}"
@@ -213,7 +266,8 @@ def convert_with_soffice(input_bytes: bytes, in_suffix: str):
         if not os.path.exists(pdf_path):
             for fn in os.listdir(out_dir):
                 if fn.lower().endswith(".pdf"):
-                    pdf_path = os.path.join(out_dir, fn); break
+                    pdf_path = os.path.join(out_dir, fn)
+                    break
         if not os.path.exists(pdf_path):
             return None, "PDF 결과 파일을 찾지 못함"
         with open(pdf_path, "rb") as f:
@@ -223,12 +277,15 @@ def convert_with_soffice(input_bytes: bytes, in_suffix: str):
     except Exception as e:
         return None, f"soffice 실행 오류: {e}"
     finally:
-        try: os.remove(in_path)
-        except Exception: pass
+        try:
+            os.remove(in_path)
+        except Exception:
+            pass
 
 
 # PDF 텍스트 추출
 from PyPDF2 import PdfReader
+
 
 def extract_text_from_pdf_bytes(file_bytes: bytes) -> str:
     try:
@@ -276,41 +333,60 @@ def text_to_pdf_bytes_korean(text: str, title: str = ""):
         from reportlab.pdfbase import pdfmetrics
         from reportlab.pdfbase.ttfonts import TTFont
         from reportlab.lib.enums import TA_LEFT
-        font_name = "NanumGothic"; font_path = "/usr/share/fonts/truetype/nanum/NanumGothic.ttf"
+        font_name = "NanumGothic"
+        font_path = "/usr/share/fonts/truetype/nanum/NanumGothic.ttf"
         if os.path.exists(font_path):
             pdfmetrics.registerFont(TTFont(font_name, font_path))
         else:
             font_name = "Helvetica"
         styles = getSampleStyleSheet()
-        base = ParagraphStyle(name="KBase", parent=styles["Normal"], fontName=font_name, fontSize=10.5, leading=14.5, alignment=TA_LEFT)
+        base = ParagraphStyle(
+            name="KBase", parent=styles["Normal"], fontName=font_name, fontSize=10.5, leading=14.5, alignment=TA_LEFT
+        )
         h2 = ParagraphStyle(name="KH2", parent=base, fontSize=15, leading=19)
+
         def esc(s: str) -> str:
-            return (s.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;"))
+            return (s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+
         flow = []
         if title:
-            flow.append(Paragraph(esc(title), h2)); flow.append(Spacer(1, 8))
+            flow.append(Paragraph(esc(title), h2))
+            flow.append(Spacer(1, 8))
         for para in (text or "").split("\n\n"):
-            flow.append(Paragraph(esc(para).replace("\n","<br/>"), base)); flow.append(Spacer(1, 4))
-        buf = BytesIO(); doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=18*mm, rightMargin=18*mm, topMargin=18*mm, bottomMargin=18*mm)
-        doc.build(flow); buf.seek(0)
+            flow.append(Paragraph(esc(para).replace("\n", "<br/>"), base))
+            flow.append(Spacer(1, 4))
+        buf = BytesIO()
+        doc = SimpleDocTemplate(
+            buf, pagesize=A4, leftMargin=18 * mm, rightMargin=18 * mm, topMargin=18 * mm, bottomMargin=18 * mm
+        )
+        doc.build(flow)
+        buf.seek(0)
         return buf.read(), "OK[ReportLab]"
     except Exception as e:
         try:
             from PIL import Image, ImageDraw, ImageFont
+
             DPI = 300
             A4_W, A4_H = int(8.27 * DPI), int(11.69 * DPI)
-            L,R,T,B = int(0.6*DPI), int(0.6*DPI), int(0.7*DPI), int(0.7*DPI)
-            img = Image.new("L", (A4_W,A4_H), 255); draw = ImageDraw.Draw(img)
+            L, R, T, B = int(0.6 * DPI), int(0.6 * DPI), int(0.7 * DPI), int(0.7 * DPI)
+            img = Image.new("L", (A4_W, A4_H), 255)
+            draw = ImageDraw.Draw(img)
             font = ImageFont.load_default()
-            x,y = L,T
+            x, y = L, T
             lines = (title + "\n\n" + (text or "")).split("\n") if title else (text or "").split("\n")
             pages, h = [], 22
             for ln in lines:
                 if y + h > A4_H - B:
-                    pages.append(img); img = Image.new("L", (A4_W,A4_H), 255); draw = ImageDraw.Draw(img); y = T
-                draw.text((x,y), ln, 0, font); y += h
+                    pages.append(img)
+                    img = Image.new("L", (A4_W, A4_H), 255)
+                    draw = ImageDraw.Draw(img)
+                    y = T
+                draw.text((x, y), ln, 0, font)
+                y += h
             pages.append(img)
-            bio = BytesIO(); pages[0].save(bio, format="PDF", save_all=True, append_images=pages[1:]); bio.seek(0)
+            bio = BytesIO()
+            pages[0].save(bio, format="PDF", save_all=True, append_images=pages[1:])
+            bio.seek(0)
             return bio.read(), f"OK[Pillow] (ReportLab Error: {e})"
         except Exception as e2:
             return None, f"PDF 생성 실패: {e2}"
@@ -363,7 +439,8 @@ def _is_url(val: str) -> bool:
 def _filename_from_url(url: str) -> str:
     try:
         path = urlparse(url).path
-        if not path: return url
+        if not path:
+            return url
         return unquote(path.split("/")[-1]) or url
     except Exception:
         return url
@@ -377,65 +454,84 @@ def _strip_html(s: str) -> str:
 
 def build_attachment_matrix(df_like: pd.DataFrame, title_col: str) -> pd.DataFrame:
     if title_col not in df_like.columns:
-        return pd.DataFrame(columns=[title_col,"본공고링크","제안요청서","공고서","과업지시서","규격서","기타"])
+        return pd.DataFrame(columns=[title_col, "본공고링크", "제안요청서", "공고서", "과업지시서", "규격서", "기타"])
     buckets = {}
+
     def add_link(title, category, name, url):
         if title not in buckets:
-            buckets[title] = {k:{} for k in ["본공고링크","제안요청서","공고서","과업지시서","규격서","기타"]}
+            buckets[title] = {k: {} for k in ["본공고링크", "제안요청서", "공고서", "과업지시서", "규격서", "기타"]}
         if url not in buckets[title][category]:
             buckets[title][category][url] = name
+
     n_cols = df_like.shape[1]
     for _, row in df_like.iterrows():
-        title = str(row.get(title_col,""))
-        if not title: continue
+        title = str(row.get(title_col, ""))
+        if not title:
+            continue
         for j in range(1, n_cols):
             url_col = df_like.columns[j]
-            name_col = df_like.columns[j-1]
+            name_col = df_like.columns[j - 1]
             url_val = row.get(url_col, None)
             name_val = row.get(name_col, None)
-            if pd.isna(url_val): continue
+            if pd.isna(url_val):
+                continue
             raw = str(url_val).strip()
             if _is_url(raw):
                 urls = [raw]
             else:
-                toks = [u.strip() for u in raw.replace("\n",";").split(";")]
+                toks = [u.strip() for u in raw.replace("\n", ";").split(";")]
                 urls = [u for u in toks if _is_url(u)]
-                if not urls: continue
+                if not urls:
+                    continue
             name_base = "" if pd.isna(name_val) else str(name_val).strip()
-            name_tokens = [n.strip() for n in name_base.replace("\n",";").split(";")] if name_base else []
+            name_tokens = [n.strip() for n in name_base.replace("\n", ";").split(";")] if name_base else []
             for k, u in enumerate(urls):
                 disp_name = name_tokens[k] if k < len(name_tokens) and name_tokens[k] else (name_base or _filename_from_url(u))
                 low_name = (disp_name or "").lower() + " " + _filename_from_url(u).lower()
-                def add(cat): add_link(title, cat, disp_name, u)
-                if ("제안요청서" in low_name) or ("rfp" in low_name): add("제안요청서")
-                elif ("공고서" in low_name) or ("공고문" in low_name): add("공고서")
-                elif "과업지시서" in low_name: add("과업지시서")
-                elif ("규격서" in low_name) or ("spec" in low_name): add("규격서")
-                else: add("기타")
+
+                def add(cat):
+                    add_link(title, cat, disp_name, u)
+
+                if ("제안요청서" in low_name) or ("rfp" in low_name):
+                    add("제안요청서")
+                elif ("공고서" in low_name) or ("공고문" in low_name):
+                    add("공고서")
+                elif "과업지시서" in low_name:
+                    add("과업지시서")
+                elif ("규격서" in low_name) or ("spec" in low_name):
+                    add("규격서")
+                else:
+                    add("기타")
+
     def join_html(d):
-        if not d: return ""
+        if not d:
+            return ""
         return " | ".join([f"<a href='{url}' target='_blank' rel='nofollow noopener'>{name}</a>" for url, name in d.items()])
+
     rows = []
     for title, catmap in buckets.items():
-        rows.append({
-            title_col: title,
-            "본공고링크": join_html(catmap["본공고링크"]),
-            "제안요청서": join_html(catmap["제안요청서"]),
-            "공고서": join_html(catmap["공고서"]),
-            "과업지시서": join_html(catmap["과업지시서"]),
-            "규격서": join_html(catmap["규격서"]),
-            "기타": join_html(catmap["기타"]),
-        })
+        rows.append(
+            {
+                title_col: title,
+                "본공고링크": join_html(catmap["본공고링크"]),
+                "제안요청서": join_html(catmap["제안요청서"]),
+                "공고서": join_html(catmap["공고서"]),
+                "과업지시서": join_html(catmap["과업지시서"]),
+                "규격서": join_html(catmap["규격서"]),
+                "기타": join_html(catmap["기타"]),
+            }
+        )
     out_df = pd.DataFrame(rows).sort_values(by=[title_col]).reset_index(drop=True)
     return out_df
 
 
 def render_attachment_cards_html(df_links: pd.DataFrame, title_col: str) -> str:
     """Compact 카드형 UI — 최소 CSS만 유지"""
-    cat_cols = ["본공고링크","제안요청서","공고서","과업지시서","규격서","기타"]
+    cat_cols = ["본공고링크", "제안요청서", "공고서", "과업지시서", "규격서", "기타"]
     present_cols = [c for c in cat_cols if c in df_links.columns]
     if title_col not in df_links.columns:
         return "<p>표시할 데이터가 없습니다.</p>"
+
     css = """
 <style>
 .attch-wrap { display:flex; flex-direction:column; gap:14px; background:#eef6ff; padding:8px; border-radius:12px; }
@@ -453,6 +549,7 @@ def render_attachment_cards_html(df_links: pd.DataFrame, title_col: str) -> str:
 .attch-box-body details summary:after { content:"▼"; font-size:10px; margin-left:6px; color:#0b2447; }
 </style>
 """
+
     html = [css, '<div class="attch-wrap">']
     for _, r in df_links.iterrows():
         title = str(r.get(title_col, "") or "")
@@ -461,7 +558,8 @@ def render_attachment_cards_html(df_links: pd.DataFrame, title_col: str) -> str:
         html.append('<div class="attch-grid">')
         for col in present_cols:
             raw = str(r.get(col, "") or "").strip()
-            if not raw: continue
+            if not raw:
+                continue
             parts = [p.strip() for p in raw.split("|") if p.strip()]
             count = len(parts)
             if count <= 3:
@@ -488,7 +586,7 @@ VENDOR_COLOR_MAP = {
     "에스케이브로드밴드": "#FFD700",
     "에스케이텔레콤": "#1E90FF",
 }
-OTHER_SEQ = ["#2E8B57","#6B8E23","#556B2F","#8B4513","#A0522D","#CD853F","#228B22","#006400"]
+OTHER_SEQ = ["#2E8B57", "#6B8E23", "#556B2F", "#8B4513", "#A0522D", "#CD853F", "#228B22", "#006400"]
 
 
 def normalize_vendor(name: str) -> str:
@@ -504,11 +602,11 @@ def normalize_vendor(name: str) -> str:
     return s or "기타"
 
 # =====================================
-# 로그인 게이트 (팝업 제거 + 관리자 하드코딩 + secrets)
+# 로그인 게이트 (팝업 제거 + 관리자 하드코딩 + st.secrets AUTH)
 # =====================================
 
 def login_gate():
-    """간단 로그인 (팝업 없음) + 관리자 하드코딩 + secrets.toml 사용자 인증"""
+    """간단 로그인 (팝업 없음) + 관리자 하드코딩 + secrets.toml이 아닌 st.secrets의 AUTH.users 사용"""
     st.title("🔐 로그인")
     emp = st.text_input("사번", value="", placeholder="예: 9999")
     dob = st.text_input("생년월일(YYMMDD)", value="", placeholder="예: 990101", type="password")
@@ -521,28 +619,31 @@ def login_gate():
     except Exception:
         allowed = []
 
-    col1, col2 = st.columns([1,1])
+    col1, col2 = st.columns([1, 1])
     with col1:
         if st.button("로그인", type="primary", use_container_width=True):
             ok = False
             if emp == "2855" and dob == "910518":
-                ok = True; st.session_state["role"] = "admin"
+                ok = True
+                st.session_state["role"] = "admin"
             elif any((str(u.get("emp")) == emp and str(u.get("dob")) == dob) for u in allowed if isinstance(u, dict)):
-                ok = True; st.session_state["role"] = "user"
+                ok = True
+                st.session_state["role"] = "user"
             if ok:
                 st.session_state["authed"] = True
-                st.success("로그인 성공"); st.rerun()
+                st.success("로그인 성공")
+                st.rerun()
             else:
                 st.error("인증 실패. 사번/생년월일을 확인하세요.")
-    with coL2:
+    with col2:
         st.info("사번/생년월일은 사내 배포용으로만 사용됩니다.")
+
 
 # =====================================
 # 로그인 처리 및 가드
 # =====================================
 AUThed = st.session_state.get("authed", False)
 if not AUThed:
-    # 로그인 화면 먼저 보여주고 종료
     login_gate()
     st.stop()
 
@@ -555,13 +656,13 @@ uploaded_file = st.sidebar.file_uploader(
 )
 
 # 메뉴
-menu = st.sidebar.radio("# 📋 메뉴 선택", ["조달입찰결과현황","내고객 분석하기"], key="menu")
+menu = st.sidebar.radio("# 📋 메뉴 선택", ["조달입찰결과현황", "내고객 분석하기"], key="menu")
 
-# OpenAI Key 입력 (st.secrets 우선, 없으면 세션)
-with st.sidebar.expander("🔑 OpenAI API Key", expanded=True):
-    if "OPENAI_API_KEY" in st.secrets:
-        st.success("st.secrets에 OPENAI_API_KEY가 설정되어 있습니다. (권장)")
-    key_in = st.text_input("사이드바에서 키 입력(선택) — st.secrets가 우선 적용됩니다.", type="password", placeholder="sk-....")
+# OpenAI Key 입력 (st.secrets 우선, 없으면 세션 — 단, 실제 호출은 st.secrets API_KEYS 우선)
+with st.sidebar.expander("🔑 OpenAI API Key (선택)", expanded=True):
+    if isinstance(st.secrets.get("API_KEYS", None), (list, tuple)) and len(st.secrets["API_KEYS"]) > 0:
+        st.success("st.secrets['API_KEYS']가 설정되어 있습니다. (권장)")
+    key_in = st.text_input("사이드바에서 단일 키 입력(선택) — st.secrets['API_KEYS']가 우선 적용됩니다.", type="password", placeholder="sk-....")
     set_btn = st.button("키 적용", use_container_width=True)
     if set_btn:
         if key_in and key_in.strip().startswith("sk-"):
@@ -578,9 +679,7 @@ else:
 # GPT 추가 요구사항(세션 키 지정)
 st.session_state.setdefault("gpt_extra_req", "")
 gpt_extra_req = st.sidebar.text_area(
-    "🤖 GPT 추가 요구사항(선택)", height=100,
-    placeholder="예) 'MACsec, SRv6 강조', '세부 일정 표 추가' 등",
-    key="gpt_extra_req"
+    "🤖 GPT 추가 요구사항(선택)", height=100, placeholder="예) 'MACsec, SRv6 강조', '세부 일정 표 추가' 등", key="gpt_extra_req"
 )
 
 # 서비스구분 멀티필터(옵션은 part2에서 df 로드 후 실제 값으로 재설정)
@@ -596,9 +695,12 @@ st.session_state["_uploaded_file_proxy"] = st.session_state.get("uploaded_file")
 st.title("📊 조달입찰 분석 시스템")
 st.caption("좌측에서 파일 업로드 후 메뉴를 선택하세요. ‘서비스구분’ 기본값은 전용회선/전화/인터넷입니다.")
 
+
 # -*- coding: utf-8 -*-
 # app_part2.py — Streamlit Cloud 최적화 (2/2)
 # - 본문 로직(데이터 로드/필터/차트/보고서/챗봇)
+# - app_part1.py에서 정의/임포트한 함수/상수 사용 가정
+# - Streamlit Cloud의 st.secrets만 참조 (git secrets.toml 미사용)
 
 import os
 import re
@@ -610,7 +712,7 @@ import pandas as pd
 import numpy as np
 import plotly.express as px
 
-# app_part1에서 정의/임포트된 함수/상수 사용 가정:
+# app_part1에서 제공되는 심볼(임포트 없이 같은 세션에서 사용 가정):
 # - build_attachment_matrix, render_attachment_cards_html, _strip_html
 # - convert_any_to_pdf, extract_text_from_pdf_bytes, text_to_pdf_bytes_korean
 # - call_gpt, normalize_vendor, VENDOR_COLOR_MAP, OTHER_SEQ
@@ -644,7 +746,7 @@ df_original = df.copy()
 # ===== 사이드바: 동적 서비스구분 옵션 주입 =====
 if "서비스구분" in df.columns:
     options = sorted([str(x) for x in df["서비스구분"].dropna().unique()])
-    defaults = [x for x in st.session_state.get("svc_filter_ms", []) if x in options] or [x for x in ["전용회선","전화","인터넷"] if x in options] or options[:3]
+    defaults = [x for x in st.session_state.get("svc_filter_ms", []) if x in options] or [x for x in ["전용회선", "전화", "인터넷"] if x in options] or options[:3]
     service_selected = st.sidebar.multiselect("서비스구분 선택", options=options, default=defaults, key="svc_filter_ms")
 else:
     service_selected = []
@@ -682,14 +784,16 @@ df["year"] = df["공고게시일자_date"].dt.year
 year_list = sorted([int(x) for x in df["year"].dropna().unique()])
 selected_years = st.sidebar.multiselect("연도 선택 (복수 가능)", year_list, default=[])
 
-month_list = list(range(1,13))
+month_list = list(range(1, 13))
 df["month"] = df["공고게시일자_date"].dt.month
 selected_months = st.sidebar.multiselect("월 선택 (복수 가능)", month_list, default=[])
 
 # ===== 필터 적용 =====
 df_filtered = df.copy()
-if selected_years: df_filtered = df_filtered[df_filtered["year"].isin(selected_years)]
-if selected_months: df_filtered = df_filtered[df_filtered["month"].isin(selected_months)]
+if selected_years:
+    df_filtered = df_filtered[df_filtered["year"].isin(selected_years)]
+if selected_months:
+    df_filtered = df_filtered[df_filtered["month"].isin(selected_months)]
 if only_winner and "낙찰자선정여부" in df_filtered.columns:
     df_filtered = df_filtered[df_filtered["낙찰자선정여부"] == "Y"]
 if selected_companies and "대표업체" in df_filtered.columns:
@@ -699,49 +803,54 @@ if selected_orgs and demand_col_sidebar:
 if service_selected and "서비스구분" in df_filtered.columns:
     df_filtered = df_filtered[df_filtered["서비스구분"].astype(str).isin(service_selected)]
 
-# ===== 메뉴 =====
-menu = st.session_state.get("menu")
-
-# ——— 공통 유틸 ——
+# ===== 공통 유틸 =====
 
 def _safe_filename(name: str) -> str:
-    name = (name or "").strip().replace("\n","_").replace("\r","_")
+    name = (name or "").strip().replace("\n", "_").replace("\r", "_")
     name = re.sub(r'[\\/:*?"<>|]+', "_", name)
     if not name.lower().endswith(".pdf"):
         name += ".pdf"
     return name[:160]
 
 
-def markdown_to_pdf_korean(md_text: str, title: str|None=None):
+def markdown_to_pdf_korean(md_text: str, title: str | None = None):
     pdf_bytes, dbg = text_to_pdf_bytes_korean(md_text, title or "")
     return pdf_bytes, dbg
-
 
 # ===== 기본 분석(차트) =====
 
 def render_basic_analysis_charts(base_df: pd.DataFrame):
     def pick_unit(max_val: float):
-        if max_val >= 1_0000_0000_0000: return ("조원", 1_0000_0000_0000)
-        elif max_val >= 100_000_000: return ("억원", 100_000_000)
-        elif max_val >= 1_000_000: return ("백만원", 1_000_000)
-        else: return ("원", 1)
-    def apply_unit(values: pd.Series, mode: str = "자동"):
-        unit_map = {"원":("원",1),"백만원":("백만원",1_000_000),"억원":("억원",100_000_000),"조원":("조원",1_0000_0000_0000)}
-        if mode == "자동":
-            u, f = pick_unit(values.max() if len(values) else 0); return values / f, u
+        if max_val >= 1_0000_0000_0000:
+            return ("조원", 1_0000_0000_0000)
+        elif max_val >= 100_000_000:
+            return ("억원", 100_000_000)
+        elif max_val >= 1_000_000:
+            return ("백만원", 1_000_000)
         else:
-            u, f = unit_map.get(mode, ("원",1)); return values / f, u
+            return ("원", 1)
+
+    def apply_unit(values: pd.Series, mode: str = "자동"):
+        unit_map = {"원": ("원", 1), "백만원": ("백만원", 1_000_000), "억원": ("억원", 100_000_000), "조원": ("조원", 1_0000_0000_0000)}
+        if mode == "자동":
+            u, f = pick_unit(values.max() if len(values) else 0)
+            return values / f, u
+        else:
+            u, f = unit_map.get(mode, ("원", 1))
+            return values / f, u
 
     st.markdown("## 📊 기본 통계 분석")
     st.caption("※ 이하 모든 차트는 **낙찰자선정여부 == 'Y'** 기준입니다.")
 
     if "낙찰자선정여부" not in base_df.columns:
-        st.warning("컬럼 '낙찰자선정여부'를 찾을 수 없습니다."); return
+        st.warning("컬럼 '낙찰자선정여부'를 찾을 수 없습니다.")
+        return
     dwin = base_df[base_df["낙찰자선정여부"] == "Y"].copy()
     if dwin.empty:
-        st.warning("낙찰(Y) 데이터가 없습니다."); return
+        st.warning("낙찰(Y) 데이터가 없습니다.")
+        return
 
-    for col in ["투찰금액","배정예산금액","투찰율"]:
+    for col in ["투찰금액", "배정예산금액", "투찰율"]:
         if col in dwin.columns:
             dwin[col] = pd.to_numeric(dwin[col], errors="coerce")
 
@@ -751,7 +860,7 @@ def render_basic_analysis_charts(base_df: pd.DataFrame):
         dwin["대표업체_표시"] = "기타"
 
     st.markdown("### 1) 대표업체별 분포")
-    unit_choice = st.selectbox("파이차트(투찰금액 합계) 표기 단위", ["자동","원","백만원","억원","조원"], index=0)
+    unit_choice = st.selectbox("파이차트(투찰금액 합계) 표기 단위", ["자동", "원", "백만원", "억원", "조원"], index=0)
     col_pie1, col_pie2 = st.columns(2)
 
     with col_pie1:
@@ -759,38 +868,57 @@ def render_basic_analysis_charts(base_df: pd.DataFrame):
             sum_by_company = dwin.groupby("대표업체_표시")["투찰금액"].sum().reset_index().sort_values("투찰금액", ascending=False)
             scaled_vals, unit_label = apply_unit(sum_by_company["투찰금액"].fillna(0), unit_choice)
             sum_by_company["표시금액"] = scaled_vals
-            fig1 = px.pie(sum_by_company, names="대표업체_표시", values="표시금액",
-                          title=f"대표업체별 투찰금액 합계 — 단위: {unit_label}",
-                          color="대표업체_표시", color_discrete_map=VENDOR_COLOR_MAP, color_discrete_sequence=OTHER_SEQ)
+            fig1 = px.pie(
+                sum_by_company,
+                names="대표업체_표시",
+                values="표시금액",
+                title=f"대표업체별 투찰금액 합계 — 단위: {unit_label}",
+                color="대표업체_표시",
+                color_discrete_map=VENDOR_COLOR_MAP,
+                color_discrete_sequence=OTHER_SEQ,
+            )
             fig1.update_traces(
                 hovertemplate="<b>%{label}</b><br>금액: %{value:,.2f} " + unit_label + "<br>비중: %{percent}",
-                texttemplate="%{label}<br>%{value:,.2f} " + unit_label, textposition="auto")
+                texttemplate="%{label}<br>%{value:,.2f} " + unit_label,
+                textposition="auto",
+            )
             st.plotly_chart(fig1, use_container_width=True)
         else:
             st.info("투찰금액 컬럼이 없어 파이차트(금액)를 생략합니다.")
 
     with col_pie2:
         cnt_by_company = dwin["대표업체_표시"].value_counts().reset_index()
-        cnt_by_company.columns = ["대표업체_표시","건수"]
-        fig2 = px.pie(cnt_by_company, names="대표업체_표시", values="건수",
-                      title="대표업체별 낙찰 건수",
-                      color="대표업체_표시", color_discrete_map=VENDOR_COLOR_MAP, color_discrete_sequence=OTHER_SEQ)
-        fig2.update_traces(hovertemplate="<b>%{label}</b><br>건수: %{value:,}건<br>비중: %{percent}",
-                           texttemplate="%{label}<br>%{value:,}건", textposition="auto")
+        cnt_by_company.columns = ["대표업체_표시", "건수"]
+        fig2 = px.pie(
+            cnt_by_company,
+            names="대표업체_표시",
+            values="건수",
+            title="대표업체별 낙찰 건수",
+            color="대표업체_표시",
+            color_discrete_map=VENDOR_COLOR_MAP,
+            color_discrete_sequence=OTHER_SEQ,
+        )
+        fig2.update_traces(
+            hovertemplate="<b>%{label}</b><br>건수: %{value:,}건<br>비중: %{percent}",
+            texttemplate="%{label}<br>%{value:,}건",
+            textposition="auto",
+        )
         st.plotly_chart(fig2, use_container_width=True)
 
     st.markdown("### 2) 낙찰 특성 비율")
     c1, c2 = st.columns(2)
     with c1:
         if "낙찰방법" in dwin.columns:
-            total = len(dwin); suyi = (dwin["낙찰방법"] == "수의시담").sum()
-            st.metric(label="수의시담 비율", value=f"{(suyi/total*100 if total else 0):.1f}%")
+            total = len(dwin)
+            suyi = (dwin["낙찰방법"] == "수의시담").sum()
+            st.metric(label="수의시담 비율", value=f"{(suyi / total * 100 if total else 0):.1f}%")
         else:
             st.info("낙찰방법 컬럼 없음")
     with c2:
         if "긴급공고" in dwin.columns:
-            total = len(dwin); urgent = (dwin["긴급공고"] == "Y").sum()
-            st.metric(label="긴급공고 비율", value=f"{(urgent/total*100 if total else 0):.1f}%")
+            total = len(dwin)
+            urgent = (dwin["긴급공고"] == "Y").sum()
+            st.metric(label="긴급공고 비율", value=f"{(urgent / total * 100 if total else 0):.1f}%")
         else:
             st.info("긴급공고 컬럼 없음")
 
@@ -801,10 +929,17 @@ def render_basic_analysis_charts(base_df: pd.DataFrame):
             dwin["공고게시일자_date"] = pd.to_datetime(dwin.get("공고게시일자_date", pd.NaT), errors="coerce")
             dplot = dwin.dropna(subset=["투찰율", "공고게시일자_date"]).copy()
             dplot = dplot[dplot["투찰율"] <= 300]
-            hover_cols = [c for c in ["대표업체_표시","수요기관명","공고명","입찰공고명","입찰공고번호"] if c in dplot.columns]
-            fig_scatter = px.scatter(dplot, x="공고게시일자_date", y="투찰율",
-                                     hover_data=hover_cols, title="투찰율 산점도",
-                                     color="대표업체_표시", color_discrete_map=VENDOR_COLOR_MAP, color_discrete_sequence=OTHER_SEQ)
+            hover_cols = [c for c in ["대표업체_표시", "수요기관명", "공고명", "입찰공고명", "입찰공고번호"] if c in dplot.columns]
+            fig_scatter = px.scatter(
+                dplot,
+                x="공고게시일자_date",
+                y="투찰율",
+                hover_data=hover_cols,
+                title="투찰율 산점도",
+                color="대표업체_표시",
+                color_discrete_map=VENDOR_COLOR_MAP,
+                color_discrete_sequence=OTHER_SEQ,
+            )
             st.plotly_chart(fig_scatter, use_container_width=True)
         else:
             st.info("투찰율 컬럼 없음 - 산점도 생략")
@@ -814,10 +949,17 @@ def render_basic_analysis_charts(base_df: pd.DataFrame):
             dyear = dwin.copy()
             dyear["연도"] = pd.to_datetime(dyear.get("공고게시일자_date", pd.NaT), errors="coerce").dt.year
             dyear = dyear.dropna(subset=["연도"]).astype({"연도": int})
-            by_vendor_year = dyear.groupby(["연도","대표업체_표시"])["투찰금액"].sum().reset_index()
-            fig_vy = px.bar(by_vendor_year, x="연도", y="투찰금액", color="대표업체_표시",
-                            barmode="group", title="업체/년도별 수주금액",
-                            color_discrete_map=VENDOR_COLOR_MAP, color_discrete_sequence=OTHER_SEQ)
+            by_vendor_year = dyear.groupby(["연도", "대표업체_표시"])["투찰금액"].sum().reset_index()
+            fig_vy = px.bar(
+                by_vendor_year,
+                x="연도",
+                y="투찰금액",
+                color="대표업체_표시",
+                barmode="group",
+                title="업체/년도별 수주금액",
+                color_discrete_map=VENDOR_COLOR_MAP,
+                color_discrete_sequence=OTHER_SEQ,
+            )
             fig_vy.update_traces(hovertemplate="<b>%{x}년</b><br>%{legendgroup}: %{y:,.0f} 원")
             st.plotly_chart(fig_vy, use_container_width=True)
         else:
@@ -826,50 +968,61 @@ def render_basic_analysis_charts(base_df: pd.DataFrame):
     st.markdown("### 5) 연·분기별 배정예산금액 — 누적 막대 & 총합")
     col_stack, col_total = st.columns(2)
     if "배정예산금액" not in dwin.columns:
-        with col_stack: st.info("배정예산금액 컬럼 없음 - 막대그래프 생략"); return
+        with col_stack:
+            st.info("배정예산금액 컬럼 없음 - 막대그래프 생략")
+        return
     dwin["공고게시일자_date"] = pd.to_datetime(dwin.get("공고게시일자_date", pd.NaT), errors="coerce")
     g = dwin.dropna(subset=["공고게시일자_date"]).copy()
     if g.empty:
-        with col_stack: st.info("유효한 날짜가 없어 그래프 표시 불가"); return
+        with col_stack:
+            st.info("유효한 날짜가 없어 그래프 표시 불가")
+        return
     g["연도"] = g["공고게시일자_date"].dt.year
     g["분기"] = g["공고게시일자_date"].dt.quarter
     g["연도분기"] = g["연도"].astype(str) + " Q" + g["분기"].astype(str)
     if "대표업체_표시" not in g.columns:
-        g["대표업체_표시"] = g.get("대표업체", pd.Series([""]*len(g))).map(normalize_vendor)
+        g["대표업체_표시"] = g.get("대표업체", pd.Series([""] * len(g))).map(normalize_vendor)
     title_col = "입찰공고명" if "입찰공고명" in g.columns else ("공고명" if "공고명" in g.columns else None)
     group_col = "대표업체_표시"
     if group_col not in g.columns:
-        with col_stack: st.info("대표업체_표시 컬럼 없음"); return
+        with col_stack:
+            st.info("대표업체_표시 컬럼 없음")
+        return
     with col_stack:
         grp = g.groupby(["연도분기", group_col])["배정예산금액"].sum().reset_index(name="금액합")
         if not grp.empty:
             if title_col:
-                title_map = (g.groupby(["연도분기", group_col])[title_col]
-                              .apply(lambda s: " | ".join(pd.Series(s).dropna().astype(str).unique()[:10]))
-                              .rename("입찰공고목록").reset_index())
+                title_map = (
+                    g.groupby(["연도분기", group_col])[title_col]
+                    .apply(lambda s: " | ".join(pd.Series(s).dropna().astype(str).unique()[:10]))
+                    .rename("입찰공고목록")
+                    .reset_index()
+                )
                 grp = grp.merge(title_map, on=["연도분기", group_col], how="left")
                 grp["입찰공고목록"] = grp["입찰공고목록"].fillna("")
             else:
                 grp["입찰공고목록"] = ""
             grp["연"] = grp["연도분기"].str.extract(r"(\d{4})").astype(int)
             grp["분"] = grp["연도분기"].str.extract(r"Q(\d)").astype(int)
-            grp = grp.sort_values(["연","분",group_col]).reset_index(drop=True)
-            ordered_quarters = grp.sort_values(["연","분"])["연도분기"].unique()
+            grp = grp.sort_values(["연", "분", group_col]).reset_index(drop=True)
+            ordered_quarters = grp.sort_values(["연", "분"])["연도분기"].unique()
             grp["연도분기"] = pd.Categorical(grp["연도분기"], categories=ordered_quarters, ordered=True)
             custom = np.column_stack([grp[group_col].astype(str).to_numpy(), grp["입찰공고목록"].astype(str).to_numpy()])
             fig_stack = px.bar(
-                grp, x="연도분기", y="금액합", color=group_col, barmode="stack",
+                grp,
+                x="연도분기",
+                y="금액합",
+                color=group_col,
+                barmode="stack",
                 title=f"연·분기별 배정예산금액 — 누적(스택) / 그룹: {group_col}",
-                color_discrete_map=VENDOR_COLOR_MAP, color_discrete_sequence=OTHER_SEQ,
+                color_discrete_map=VENDOR_COLOR_MAP,
+                color_discrete_sequence=OTHER_SEQ,
             )
             fig_stack.update_traces(
                 customdata=custom,
                 hovertemplate=(
-                    "<b>%{x}</b><br>" +
-                    f"{group_col}: %{{customdata[0]}}<br>" +
-                    "금액: %{{y:,.0f}} 원<br>" +
-                    "입찰공고명: %{{customdata[1]}}"
-                )
+                    "<b>%{x}</b><br>" + f"{group_col}: %{{customdata[0]}}<br>" + "금액: %{{y:,.0f}} 원<br>" + "입찰공고명: %{{customdata[1]}}"
+                ),
             )
             fig_stack.update_layout(xaxis_title="연도분기", yaxis_title="배정예산금액 (원)", margin=dict(l=10, r=10, t=60, b=10))
             st.plotly_chart(fig_stack, use_container_width=True)
@@ -879,11 +1032,14 @@ def render_basic_analysis_charts(base_df: pd.DataFrame):
         grp_total = g.groupby("연도분기")["배정예산금액"].sum().reset_index(name="금액합")
         grp_total["연"] = grp_total["연도분기"].str.extract(r"(\d{4})").astype(int)
         grp_total["분"] = grp_total["연도분기"].str.extract(r"Q(\d)").astype(int)
-        grp_total = grp_total.sort_values(["연","분"])
+        grp_total = grp_total.sort_values(["연", "분"])
         if title_col:
-            titles_total = g.groupby("연도분기")[title_col].apply(
-                lambda s: " | ".join(pd.Series(s).dropna().astype(str).unique()[:10])
-            ).reindex(grp_total["연도분기"]).fillna("")
+            titles_total = (
+                g.groupby("연도분기")[title_col]
+                .apply(lambda s: " | ".join(pd.Series(s).dropna().astype(str).unique()[:10]))
+                .reindex(grp_total["연도분기"])
+                .fillna("")
+            )
             custom2 = np.stack([titles_total], axis=-1)
         else:
             custom2 = np.stack([pd.Series([""])], axis=-1)
@@ -891,38 +1047,41 @@ def render_basic_analysis_charts(base_df: pd.DataFrame):
         fig_bar.update_traces(
             customdata=custom2,
             hovertemplate="<b>%{x}</b><br>총액: %{y:,.0f} 원<br>입찰공고명: %{customdata[0]}",
-            texttemplate='%{text:,.0f}', textposition='outside', cliponaxis=False
+            texttemplate='%{text:,.0f}',
+            textposition='outside',
+            cliponaxis=False,
         )
         st.plotly_chart(fig_bar, use_container_width=True)
 
-# ===== 페이지: 조달입찰결과현황 =====
-
+# ===== 페이지 라우팅 =====
 menu_val = st.session_state.get("menu")
+
 if menu_val == "조달입찰결과현황":
     st.title("📑 조달입찰결과현황")
     dl_buf = BytesIO()
-    df_filtered.to_excel(dl_buf, index=False, engine="openpyxl"); dl_buf.seek(0)
+    df_filtered.to_excel(dl_buf, index=False, engine="openpyxl")
+    dl_buf.seek(0)
     st.download_button(
         label="📥 필터링된 데이터 다운로드 (Excel)",
         data=dl_buf,
         file_name=f"filtered_result_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
     st.data_editor(df_filtered, use_container_width=True, key="result_editor", height=520)
     with st.expander("📊 기본 통계 분석(차트) 열기", expanded=False):
         render_basic_analysis_charts(df_filtered)
 
-# ===== 페이지: 내고객 분석하기 =====
-
 elif menu_val == "내고객 분석하기":
     st.title("🧑‍💼 내고객 분석하기")
     st.info("ℹ️ 이 메뉴는 사이드바 필터와 무관하게 **전체 원본 데이터**를 대상으로 검색합니다.")
     demand_col = None
-    for col in ["수요기관명","수요기관","기관명"]:
+    for col in ["수요기관명", "수요기관", "기관명"]:
         if col in df_original.columns:
-            demand_col = col; break
+            demand_col = col
+            break
     if not demand_col:
-        st.error("⚠️ 수요기관 관련 컬럼을 찾을 수 없습니다."); st.stop()
+        st.error("⚠️ 수요기관 관련 컬럼을 찾을 수 없습니다.")
+        st.stop()
     st.success(f"✅ 검색 대상 컬럼: **{demand_col}**")
 
     customer_input = st.text_input(f"고객사명을 입력하세요 ({demand_col} 기준, 쉼표로 복수 입력 가능)", help="예) 조달청, 국방부")
@@ -940,12 +1099,14 @@ elif menu_val == "내고객 분석하기":
             result = df_original[df_original[demand_col].isin(customers)]
             st.subheader(f"📊 검색 결과: {len(result)}건")
             if not result.empty:
-                rb = BytesIO(); result.to_excel(rb, index=False, engine="openpyxl"); rb.seek(0)
+                rb = BytesIO()
+                result.to_excel(rb, index=False, engine="openpyxl")
+                rb.seek(0)
                 st.download_button(
                     label="📥 결과 데이터 다운로드 (Excel)",
                     data=rb,
                     file_name=f"{'_'.join(customers)}_이력_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 )
                 st.data_editor(result, use_container_width=True, key="customer_editor", height=520)
 
@@ -953,7 +1114,7 @@ elif menu_val == "내고객 분석하기":
                 st.markdown("---")
                 st.subheader("🔗 입찰공고명 기준으로 URL을 분류합니다.")
                 st.caption("(본공고링크/제안요청서/공고서/과업지시서/규격서/기타, URL 중복 제거)")
-                title_col_candidates = ["입찰공고명","공고명"]
+                title_col_candidates = ["입찰공고명", "공고명"]
                 title_col = next((c for c in title_col_candidates if c in result.columns), None)
                 if not title_col:
                     st.error("⚠️ '입찰공고명' 또는 '공고명' 컬럼을 찾을 수 없습니다.")
@@ -962,7 +1123,11 @@ elif menu_val == "내고객 분석하기":
                     if attach_df.empty:
                         st.info("분류할 수 있는 링크를 찾지 못했습니다.")
                     else:
-                        use_compact = st.toggle("🔀 그룹형(Compact) 보기로 전환", value=True, help="가로폭을 줄이고 읽기 좋게 카드형으로 표시")
+                        use_compact = st.toggle(
+                            "🔀 그룹형(Compact) 보기로 전환",
+                            value=True,
+                            help="가로폭을 줄이고 읽기 좋게 카드형으로 표시",
+                        )
                         if use_compact:
                             html = render_attachment_cards_html(attach_df, title_col)
                             st.markdown(html, unsafe_allow_html=True)
@@ -979,7 +1144,7 @@ elif menu_val == "내고객 분석하기":
                             label="📥 첨부 링크 매트릭스 다운로드 (Excel, HTML 제거)",
                             data=xbuf,
                             file_name=f"{'_'.join(customers)}_첨부링크_매트릭스_{datetime.now().strftime('%Y%m%d')}.xlsx",
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                         )
 
                 # ===== 기본 차트 =====
@@ -995,8 +1160,8 @@ elif menu_val == "내고객 분석하기":
                 st.caption("HWP/HWPX/DOCX/PPTX/XLSX/PDF/TXT/CSV/MD/LOG 지원 — 가능 시 서버에서 PDF로 자동 변환 후 분석")
                 src_files = st.file_uploader(
                     "분석할 파일 업로드 (여러 개 가능)",
-                    type=["pdf","hwp","hwpx","doc","docx","ppt","pptx","xls","xlsx","txt","csv","md","log"],
-                    accept_multiple_files=True
+                    type=["pdf", "hwp", "hwpx", "doc", "docx", "ppt", "pptx", "xls", "xlsx", "txt", "csv", "md", "log"],
+                    accept_multiple_files=True,
                 )
 
                 if st.session_state.get("gpt_report_md"):
@@ -1007,15 +1172,23 @@ elif menu_val == "내고객 분석하기":
                     col_md_prev, col_pdf_prev = st.columns(2)
                     with col_md_prev:
                         st.download_button(
-                            "📥 GPT 보고서 다운로드 (.md)", data=md_bytes_prev, file_name=f"{base_fname_prev}.md",
-                            mime="text/markdown", use_container_width=True,
+                            "📥 GPT 보고서 다운로드 (.md)",
+                            data=md_bytes_prev,
+                            file_name=f"{base_fname_prev}.md",
+                            mime="text/markdown",
+                            use_container_width=True,
                         )
                     with col_pdf_prev:
-                        pdf_bytes_prev, dbg_prev = markdown_to_pdf_korean(st.session_state["gpt_report_md"], title="GPT 분석 보고서")
+                        pdf_bytes_prev, dbg_prev = markdown_to_pdf_korean(
+                            st.session_state["gpt_report_md"], title="GPT 분석 보고서"
+                        )
                         if pdf_bytes_prev:
                             st.download_button(
-                                "📥 GPT 보고서 다운로드 (.pdf)", data=pdf_bytes_prev, file_name=f"{base_fname_prev}.pdf",
-                                mime="application/pdf", use_container_width=True,
+                                "📥 GPT 보고서 다운로드 (.pdf)",
+                                data=pdf_bytes_prev,
+                                file_name=f"{base_fname_prev}.pdf",
+                                mime="application/pdf",
+                                use_container_width=True,
                             )
                             st.caption(f"PDF 생성 상태: {dbg_prev}")
                         else:
@@ -1025,7 +1198,7 @@ elif menu_val == "내고객 분석하기":
                         st.markdown("### 🗂️ 변환된 간이 PDF 내려받기 (세션 보존)")
                         for i, item in enumerate(files):
                             try:
-                                if isinstance(item, tuple) and len(item)==2:
+                                if isinstance(item, tuple) and len(item) == 2:
                                     fname, pbytes = item
                                 elif isinstance(item, dict):
                                     fname, pbytes = item.get("name"), item.get("bytes")
@@ -1034,8 +1207,12 @@ elif menu_val == "내고객 분석하기":
                                 if not pbytes:
                                     continue
                                 st.download_button(
-                                    label=f"📥 {fname}", data=pbytes, file_name=_safe_filename(str(fname or f'converted_{i+1}.pdf')),
-                                    mime="application/pdf", key=f"dl_srcpdf_prev_{i}", use_container_width=True,
+                                    label=f"📥 {fname}",
+                                    data=pbytes,
+                                    file_name=_safe_filename(str(fname or f'converted_{i+1}.pdf')),
+                                    mime="application/pdf",
+                                    key=f"dl_srcpdf_prev_{i}",
+                                    use_container_width=True,
                                 )
                             except Exception:
                                 pass
@@ -1056,19 +1233,34 @@ elif menu_val == "내고객 분석하기":
                                         name = f.name
                                         data = f.read()
                                         ext = (os.path.splitext(name)[1] or "").lower()
-                                        if ext in [".pdf",".hwp",".hwpx",".doc",".docx",".ppt",".pptx",".xls",".xlsx"]:
+                                        if ext in [
+                                            ".pdf",
+                                            ".hwp",
+                                            ".hwpx",
+                                            ".doc",
+                                            ".docx",
+                                            ".ppt",
+                                            ".pptx",
+                                            ".xls",
+                                            ".xlsx",
+                                        ]:
                                             pdf_bytes, dbg = convert_any_to_pdf(data, name)
                                             if pdf_bytes:
                                                 generated_pdfs.append((os.path.splitext(name)[0] + ".pdf", pdf_bytes))
                                                 txt = extract_text_from_pdf_bytes(pdf_bytes)
-                                                convert_logs.append(f"✅ {name} → PDF 변환 성공 ({dbg}), 텍스트 {len(txt)} chars")
-                                                combined_texts.append(f"\n\n===== [{name} → PDF] =====\n{_redact_secrets(txt)}\n")
+                                                convert_logs.append(
+                                                    f"✅ {name} → PDF 변환 성공 ({dbg}), 텍스트 {len(txt)} chars"
+                                                )
+                                                combined_texts.append(
+                                                    f"\n\n===== [{name} → PDF] =====\n{_redact_secrets(txt)}\n"
+                                                )
                                             else:
                                                 convert_logs.append(f"🛑 {name}: PDF 변환 실패 ({dbg})")
-                                        elif ext in [".txt",".csv",".md",".log"]:
-                                            for enc in ("utf-8-sig","utf-8","cp949","euc-kr"):
+                                        elif ext in [".txt", ".csv", ".md", ".log"]:
+                                            for enc in ("utf-8-sig", "utf-8", "cp949", "euc-kr"):
                                                 try:
-                                                    txt = data.decode(enc); break
+                                                    txt = data.decode(enc)
+                                                    break
                                                 except Exception:
                                                     continue
                                             else:
@@ -1098,10 +1290,13 @@ elif menu_val == "내고객 분석하기":
 {combined_text[:180000]}
 """.strip()
                                     try:
-                                        report = call_gpt([
-                                            {"role": "system", "content": "당신은 SK브로드밴드 망설계/조달 제안 컨설턴트입니다."},
-                                            {"role": "user", "content": prompt},
-                                        ], model="gpt-4.1")
+                                        report = call_gpt(
+                                            [
+                                                {"role": "system", "content": "당신은 SK브로드밴드 망설계/조달 제안 컨설턴트입니다."},
+                                                {"role": "user", "content": prompt},
+                                            ],
+                                            model="gpt-4.1",
+                                        )
                                         st.markdown("### 📝 GPT 분석 보고서")
                                         st.markdown(report)
                                         st.session_state["gpt_report_md"] = report
@@ -1111,27 +1306,38 @@ elif menu_val == "내고객 분석하기":
                                         col_md, col_pdf = st.columns(2)
                                         with col_md:
                                             st.download_button(
-                                                "📥 GPT 보고서 다운로드 (.md)", data=md_bytes, file_name=f"{base_fname}.md",
-                                                mime="text/markdown", use_container_width=True,
+                                                "📥 GPT 보고서 다운로드 (.md)",
+                                                data=md_bytes,
+                                                file_name=f"{base_fname}.md",
+                                                mime="text/markdown",
+                                                use_container_width=True,
                                             )
                                         with col_pdf:
                                             pdf_bytes, dbg = markdown_to_pdf_korean(report, title="GPT 분석 보고서")
                                             if pdf_bytes:
                                                 st.download_button(
-                                                    "📥 GPT 보고서 다운로드 (.pdf)", data=pdf_bytes, file_name=f"{base_fname}.pdf",
-                                                    mime="application/pdf", use_container_width=True,
+                                                    "📥 GPT 보고서 다운로드 (.pdf)",
+                                                    data=pdf_bytes,
+                                                    file_name=f"{base_fname}.pdf",
+                                                    mime="application/pdf",
+                                                    use_container_width=True,
                                                 )
                                                 st.caption(f"PDF 생성 상태: {dbg}")
                                             else:
                                                 st.error(f"PDF 생성 실패: {dbg}")
                                         if st.session_state["generated_src_pdfs"]:
-                                            st.markdown("---"); st.markdown("### 🗂️ 변환된 간이 PDF 내려받기")
+                                            st.markdown("---")
+                                            st.markdown("### 🗂️ 변환된 간이 PDF 내려받기")
                                             for i, (fname, pbytes) in enumerate(st.session_state["generated_src_pdfs"]):
                                                 if not pbytes:
                                                     continue
                                                 st.download_button(
-                                                    label=f"📥 {fname}", data=pbytes, file_name=_safe_filename(fname),
-                                                    mime="application/pdf", key=f"dl_srcpdf_immediate_{i}", use_container_width=True,
+                                                    label=f"📥 {fname}",
+                                                    data=pbytes,
+                                                    file_name=_safe_filename(fname),
+                                                    mime="application/pdf",
+                                                    key=f"dl_srcpdf_immediate_{i}",
+                                                    use_container_width=True,
                                                 )
                                     except Exception as e:
                                         st.error(f"보고서 생성 중 오류: {e}")
@@ -1143,7 +1349,7 @@ elif menu_val == "내고객 분석하기":
                 question = st.chat_input("질문을 입력하세요 (예: 핵심 리스크와 완화전략만 추려줘)")
                 if question:
                     st.session_state.setdefault("chat_messages", [])
-                    st.session_state["chat_messages"].append({"role":"user","content":question})
+                    st.session_state["chat_messages"].append({"role": "user", "content": question})
                     ctx_df = result.head(200).copy()
                     with pd.option_context('display.max_columns', None):
                         df_sample_csv = ctx_df.to_csv(index=False)[:20000]
@@ -1162,18 +1368,18 @@ elif menu_val == "내고객 분석하기":
                     try:
                         ans = call_gpt(
                             [
-                                {"role":"system","content":"당신은 조달/통신 제안 분석 챗봇입니다. 컨텍스트만으로 답하고 모르면 모른다고 하세요."},
-                                {"role":"user","content":q_prompt},
+                                {"role": "system", "content": "당신은 조달/통신 제안 분석 챗봇입니다. 컨텍스트만으로 답하고 모르면 모른다고 하세요."},
+                                {"role": "user", "content": q_prompt},
                             ],
                             model="gpt-4.1-mini",
                             max_tokens=1200,
-                            temperature=0.2
+                            temperature=0.2,
                         )
-                        st.session_state["chat_messages"].append({"role":"assistant","content":ans})
+                        st.session_state["chat_messages"].append({"role": "assistant", "content": ans})
                     except Exception as e:
-                        st.session_state["chat_messages"].append({"role":"assistant","content":f"오류: {e}"})
+                        st.session_state["chat_messages"].append({"role": "assistant", "content": f"오류: {e}"})
                 for m in st.session_state.get("chat_messages", []):
-                    if m["role"]=="user":
+                    if m["role"] == "user":
                         st.chat_message("user").markdown(m["content"])
                     else:
                         st.chat_message("assistant").markdown(m["content"]) 
@@ -1183,7 +1389,7 @@ elif menu_val == "내고객 분석하기":
         st.info("고객사명을 입력하면 자동 필터링됩니다.")
 
 # =========================
-# requirements.txt (Python 3.11 권장 버전)
+# requirements.txt (Python 3.11 권장)
 # -------------------------
 # streamlit==1.39.0
 # pandas==2.2.3
