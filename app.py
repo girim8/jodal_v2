@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
-# app.py — Streamlit Cloud 단일 파일 통합본 (중복 key 오류 수정판)
-# - Secrets(API_KEYS 배열, [[AUTH.users]] 목록) 안정 파싱
+# app.py — Streamlit Cloud 단일 파일 통합본 (A안, 2분할 중 1/2)
+# - Secrets(API_KEYS, [[AUTH.users]]) 안정 파싱
 # - 로그인(팝업 없음) + 관리자 백도어(emp=2855, dob=910518)
 # - 업로드 엑셀(filtered 시트) 로드/필터/차트/다운로드
 # - 첨부 링크 매트릭스 + Compact 카드 UI
-# - HWP/HWPX/DOCX/PPTX/XLSX/PDF 변환: hwp5txt → unoconv → soffice →(실패 시) 간이 PDF 생성
-# - OpenAI v1(>=1.0)/v0.28 모두 호환되는 call_gpt 래퍼, proxies 인자 사용 금지
+# - HWP/HWPX/DOCX/PPTX/XLSX/PDF 변환: hwp5txt → unoconv → soffice →(실패 시) 간이 PDF
+# - OpenAI v1/v0.28 호환 call_gpt 래퍼 (proxies 인자 사용 금지)
 # - 보고서(.md/.pdf) 생성 + 변환 PDF 묶음 다운로드 + 컨텍스트 챗봇
-# - Python 3.11 기준, Streamlit Cloud 권장 버전 주석 하단 참고
+# - Python 3.11 기준, Streamlit Cloud 권장 버전은 문서 하단 주석 참고
 
 import os
 import re
@@ -47,8 +47,7 @@ for k, v in {
     "chat_messages": [],
     "OPENAI_API_KEY": None,
     "role": None,
-    # 🔑 초기가용 서비스 필터 seed (사이드바에서 안내용 — 실제 동적 필터는 업로드 후 생성)
-    "svc_filter_seed": ["전용회선", "전화", "인터넷"],
+    "svc_filter_seed": ["전용회선", "전화", "인터넷"],  # 업로드 전 안내용 seed
 }.items():
     if k not in st.session_state:
         st.session_state[k] = v
@@ -59,19 +58,16 @@ HTML_TAG_RE = re.compile(r"<[^>]+>")
 # =============================
 # 민감정보 마스킹
 # =============================
-
 def _redact_secrets(text: str) -> str:
     if not isinstance(text, str):
         return text
     text = re.sub(r"sk-[A-Za-z0-9_\-]{20,}", "[REDACTED_KEY]", text)
     text = re.sub(r'(?i)\b(gpt_api_key|OPENAI_API_KEY)\s*=\s*([\'"]).*?\2', r'\1=\2[REDACTED]\2', text)
-
     return text
 
 # =============================
 # Secrets 헬퍼
 # =============================
-
 def _get_api_keys_from_secrets() -> list:
     keys = []
     try:
@@ -85,7 +81,6 @@ def _get_api_keys_from_secrets() -> list:
     except Exception:
         pass
     return list(dict.fromkeys(keys))
-
 
 def _get_auth_users_from_secrets() -> list:
     users = []
@@ -101,7 +96,6 @@ def _get_auth_users_from_secrets() -> list:
 # =============================
 # OpenAI 래퍼 (v1 기본, v0.28 폴백)
 # =============================
-
 def _get_openai_client():
     # v1 우선
     try:
@@ -131,7 +125,6 @@ def _get_openai_client():
             return openai, True, "LEGACY"
         except Exception as e2:
             return None, False, f"openai 미설치/초기화 실패: {e2}"
-
 
 def call_gpt(messages, temperature=0.4, max_tokens=2000, model="gpt-4.1"):
     client, enabled, status = _get_openai_client()
@@ -185,10 +178,8 @@ def call_gpt(messages, temperature=0.4, max_tokens=2000, model="gpt-4.1"):
 # =============================
 # 변환/추출 유틸 — HWP/HWPX/PDF 파이프라인
 # =============================
-
 def _which(cmd: str):
     return shutil.which(cmd)
-
 
 def _safe_tmp_write(data: bytes, suffix: str) -> str:
     fd, path = tempfile.mkstemp(suffix=suffix)
@@ -196,7 +187,6 @@ def _safe_tmp_write(data: bytes, suffix: str) -> str:
     with open(path, "wb") as f:
         f.write(data)
     return path
-
 
 def convert_hwp_with_hwp5txt(input_bytes: bytes):
     exe = _which("hwp5txt")
@@ -218,7 +208,6 @@ def convert_hwp_with_hwp5txt(input_bytes: bytes):
             os.remove(in_path)
         except Exception:
             pass
-
 
 def convert_with_unoconv(input_bytes: bytes, in_suffix: str):
     exe = _which("unoconv")
@@ -250,7 +239,6 @@ def convert_with_unoconv(input_bytes: bytes, in_suffix: str):
         except Exception:
             pass
 
-
 def convert_with_soffice(input_bytes: bytes, in_suffix: str):
     soffice = _which("soffice") or _which("libreoffice")
     if not soffice:
@@ -258,7 +246,9 @@ def convert_with_soffice(input_bytes: bytes, in_suffix: str):
     in_path = _safe_tmp_write(input_bytes, in_suffix)
     out_dir = os.path.dirname(in_path)
     try:
-        cp = subprocess.run([soffice, "--headless", "--nologo", "--nofirststartwizard", "--convert-to", "pdf", "--outdir", out_dir, in_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
+        cp = subprocess.run([soffice, "--headless", "--nologo", "--nofirststartwizard",
+                             "--convert-to", "pdf", "--outdir", out_dir, in_path],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
         if cp.returncode != 0:
             return None, f"soffice 변환 실패: {cp.stderr.decode(errors='ignore')[:400]}"
         pdf_path = os.path.splitext(in_path)[0] + ".pdf"
@@ -284,9 +274,8 @@ def convert_with_soffice(input_bytes: bytes, in_suffix: str):
 # PDF 텍스트 추출
 try:
     from PyPDF2 import PdfReader
-except Exception:  # PyPDF2 미설치 시 안전 처리
+except Exception:
     PdfReader = None  # type: ignore
-
 
 def extract_text_from_pdf_bytes(file_bytes: bytes) -> str:
     try:
@@ -298,11 +287,9 @@ def extract_text_from_pdf_bytes(file_bytes: bytes) -> str:
         return f"[PDF 추출 실패] {e}"
 
 # HWPX 텍스트 추출
-
 def _lazy_import_etree():
     import xml.etree.ElementTree as ET
     return ET
-
 
 def extract_text_from_hwpx_bytes(file_bytes: bytes) -> str:
     try:
@@ -329,7 +316,6 @@ def extract_text_from_hwpx_bytes(file_bytes: bytes) -> str:
         return f"[HWPX 추출 실패] {e}"
 
 # 텍스트 → 간이 PDF
-
 def text_to_pdf_bytes_korean(text: str, title: str = ""):
     try:
         from reportlab.lib.pagesizes import A4
@@ -379,7 +365,6 @@ def text_to_pdf_bytes_korean(text: str, title: str = ""):
             return None, f"PDF 생성 실패: {e2}"
 
 # 통합 변환 엔트리
-
 def convert_any_to_pdf(file_bytes: bytes, filename: str):
     ext = (os.path.splitext(filename)[1] or "").lower()
     if ext == ".hwp":
@@ -412,11 +397,9 @@ def convert_any_to_pdf(file_bytes: bytes, filename: str):
 # =============================
 # 첨부 링크 매트릭스 (Compact 카드 UI)
 # =============================
-
 def _is_url(val: str) -> bool:
     s = str(val).strip()
     return s.startswith("http://") or s.startswith("https://")
-
 
 def _filename_from_url(url: str) -> str:
     try:
@@ -427,12 +410,10 @@ def _filename_from_url(url: str) -> str:
     except Exception:
         return url
 
-
 def _strip_html(s: str) -> str:
     if pd.isna(s):
         return ""
     return HTML_TAG_RE.sub("", str(s))
-
 
 def build_attachment_matrix(df_like: pd.DataFrame, title_col: str) -> pd.DataFrame:
     if title_col not in df_like.columns:
@@ -524,7 +505,6 @@ CSS_COMPACT = """
 </style>
 """
 
-
 def render_attachment_cards_html(df_links: pd.DataFrame, title_col: str) -> str:
     cat_cols = ["본공고링크", "제안요청서", "공고서", "과업지시서", "규격서", "기타"]
     present_cols = [c for c in cat_cols if c in df_links.columns]
@@ -567,7 +547,6 @@ VENDOR_COLOR_MAP = {
 }
 OTHER_SEQ = ["#2E8B57", "#6B8E23", "#556B2F", "#8B4513", "#A0522D", "#CD853F", "#228B22", "#006400"]
 
-
 def normalize_vendor(name: str) -> str:
     s = str(name) if pd.notna(name) else ""
     if "엘지유플러스" in s or "LG유플러스" in s or "LG U" in s.upper():
@@ -583,9 +562,7 @@ def normalize_vendor(name: str) -> str:
 # =============================
 # 로그인 게이트
 # =============================
-
 INFO_BOX = "사번/생년월일은 사내 배포용으로만 사용됩니다."
-
 
 def login_gate():
     st.title("🔐 로그인")
@@ -613,18 +590,13 @@ def login_gate():
 # =============================
 # 사이드바 공통 위젯 (업로드/메뉴/키)
 # =============================
-
-# ⚠️ 핵심 수정: 여기서는 '안내용 seed multiselect'에 key="svc_filter_seed"를 사용합니다.
-# 업로드 후 실제 옵션으로 다시 만드는 동적 multiselect는 key="svc_filter_ms"로 별도 생성하여
-# StreamlitDuplicateElementKey 오류를 방지합니다.
-
 def render_sidebar_common():
     st.sidebar.title("📂 데이터 업로드")
     st.sidebar.file_uploader("filtered 시트가 포함된 병합 엑셀 업로드 (.xlsx)", type=["xlsx"], key="uploaded_file")
 
     st.sidebar.radio("# 📋 메뉴 선택", ["조달입찰결과현황", "내고객 분석하기"], key="menu")
 
-    # 안내용(초기) 서비스 필터 — 실제 필터는 업로드 후 데이터 컬럼 기반으로 다시 생성
+    # 안내용 seed — 업로드 후 실제 multiselect는 다른 key로 생성
     st.sidebar.multiselect(
         "서비스구분 선택 (업로드 전 임시)",
         options=SERVICE_DEFAULT,
@@ -669,7 +641,6 @@ render_sidebar_common()
 # =============================
 # 업로드/데이터 로드
 # =============================
-
 uploaded_file = st.session_state.get("uploaded_file")
 if not uploaded_file:
     st.info("좌측에서 'filtered' 시트를 포함한 엑셀 파일을 업로드하세요.")
@@ -686,9 +657,6 @@ df_original = df.copy()
 # =============================
 # 동적 사이드바 필터 옵션 (업로드 후 실제 생성)
 # =============================
-
-# ⚠️ 여기서 실제 동적 multiselect를 key="svc_filter_ms"로 새로 만들기 때문에
-# 상단 seed(multiselect)와 key가 달라 충돌이 발생하지 않습니다.
 if "서비스구분" in df.columns:
     options = sorted([str(x) for x in df["서비스구분"].dropna().unique()])
     defaults = [x for x in st.session_state.get("svc_filter_seed", SERVICE_DEFAULT) if x in options] or \
@@ -697,7 +665,7 @@ if "서비스구분" in df.columns:
         "서비스구분 선택",
         options=options,
         default=defaults,
-        key="svc_filter_ms",
+        key="svc_filter_ms",  # ⚠️ seed와 다른 key로 충돌 방지
     )
 else:
     service_selected = []
@@ -735,7 +703,6 @@ df["month"] = df["공고게시일자_date"].dt.month
 selected_months = st.sidebar.multiselect("월 선택 (복수 가능)", month_list, default=[])
 
 # 필터 적용
-
 df_filtered = df.copy()
 if selected_years:
     df_filtered = df_filtered[df_filtered["year"].isin(selected_years)]
@@ -753,14 +720,12 @@ if service_selected and "서비스구분" in df_filtered.columns:
 # =============================
 # 공통 유틸
 # =============================
-
 def _safe_filename(name: str) -> str:
     name = (name or "").strip().replace("\n", "_").replace("\r", "_")
     name = re.sub(r'[\\/:*?"<>|]+', "_", name)
     if not name.lower().endswith(".pdf"):
         name += ".pdf"
     return name[:160]
-
 
 def markdown_to_pdf_korean(md_text: str, title: str | None = None):
     pdf_bytes, dbg = text_to_pdf_bytes_korean(md_text, title or "")
@@ -769,7 +734,6 @@ def markdown_to_pdf_korean(md_text: str, title: str | None = None):
 # =============================
 # 기본 분석(차트)
 # =============================
-
 def render_basic_analysis_charts(base_df: pd.DataFrame):
     def pick_unit(max_val: float):
         if max_val >= 1_0000_0000_0000:
@@ -972,7 +936,10 @@ def render_basic_analysis_charts(base_df: pd.DataFrame):
             fig_stack.update_traces(
                 customdata=custom,
                 hovertemplate=(
-                    "<b>%{x}</b><br>" + f"{group_col}: %{{customdata[0]}}<br>" + "금액: %{{y:,.0f}} 원<br>" + "입찰공고명: %{{customdata[1]}}"
+                    "<b>%{x}</b><br>"
+                    f"{group_col}: %{{customdata[0]}}<br>"
+                    "금액: %{{y:,.0f}} 원<br>"
+                    "입찰공고명: %{{customdata[1]}}"
                 ),
             )
             fig_stack.update_layout(xaxis_title="연도분기", yaxis_title="배정예산금액 (원)", margin=dict(l=10, r=10, t=60, b=10))
@@ -1002,14 +969,12 @@ def render_basic_analysis_charts(base_df: pd.DataFrame):
             cliponaxis=False,
         )
         st.plotly_chart(fig_bar, use_container_width=True)
-
 # ======= 여기까지 1/2 =======
 # ======= 2/2 시작 =======
 
 # =============================
 # 메뉴: 조달입찰결과현황 / 내고객 분석하기
 # =============================
-
 menu_val = st.session_state.get("menu")
 
 if menu_val == "조달입찰결과현황":
@@ -1293,11 +1258,7 @@ elif menu_val == "내고객 분석하기":
                     if m["role"] == "user":
                         st.chat_message("user").markdown(m["content"])
                     else:
-                        st.chat_message("assistant").markdown(m["content"]) 
-        else:
-            st.info("고객사명을 입력하면 자동 필터링됩니다.")
-    else:
-        st.info("고객사명을 입력하면 자동 필터링됩니다.")
+                        st.chat_message("assistant").markdown(m["content"])
 
 # =============================
 # (참고) requirements.txt 권장 버전
@@ -1314,5 +1275,4 @@ elif menu_val == "내고객 분석하기":
 # Pillow==10.4.0
 # python-docx==1.1.2   # (선택)
 # (시스템 패키지) unoconv / libreoffice / hwp5txt (서버 사전 설치 필요)
-
 # ======= 2/2 끝 =======
