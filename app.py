@@ -64,7 +64,8 @@ def _redact_secrets(text: str) -> str:
     if not isinstance(text, str):
         return text
     text = re.sub(r"sk-[A-Za-z0-9_\-]{20,}", "[REDACTED_KEY]", text)
-    text = re.sub(r"OPENAI_API_KEY\s*=\s*["]{1}.*?["]{1}", 'OPENAI_API_KEY="[REDACTED]"', text)
+    text = re.sub(r'(?i)\b(gpt_api_key|OPENAI_API_KEY)\s*=\s*([\'"]).*?\2', r'\1=\2[REDACTED]\2', text)
+
     return text
 
 # =============================
