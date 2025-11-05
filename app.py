@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# app.py — Streamlit Cloud 단일 파일 통합본
+# app.py — Streamlit Cloud 단일 파일 통합본 (중복 key 오류 수정판)
 # - Secrets(API_KEYS 배열, [[AUTH.users]] 목록) 안정 파싱
 # - 로그인(팝업 없음) + 관리자 백도어(emp=2855, dob=910518)
 # - 업로드 엑셀(filtered 시트) 로드/필터/차트/다운로드
@@ -47,6 +47,8 @@ for k, v in {
     "chat_messages": [],
     "OPENAI_API_KEY": None,
     "role": None,
+    # 🔑 초기가용 서비스 필터 seed (사이드바에서 안내용 — 실제 동적 필터는 업로드 후 생성)
+    "svc_filter_seed": ["전용회선", "전화", "인터넷"],
 }.items():
     if k not in st.session_state:
         st.session_state[k] = v
@@ -62,7 +64,7 @@ def _redact_secrets(text: str) -> str:
     if not isinstance(text, str):
         return text
     text = re.sub(r"sk-[A-Za-z0-9_\-]{20,}", "[REDACTED_KEY]", text)
-    text = re.sub(r"OPENAI_API_KEY\s*=\s*[\"\'].*?[\"\']", 'OPENAI_API_KEY="[REDACTED]"', text)
+    text = re.sub(r"OPENAI_API_KEY\s*=\s*["]{1}.*?["]{1}", 'OPENAI_API_KEY="[REDACTED]"', text)
     return text
 
 # =============================
@@ -608,14 +610,27 @@ def login_gate():
         st.info(INFO_BOX)
 
 # =============================
-# 사이드바 공통 위젯
+# 사이드바 공통 위젯 (업로드/메뉴/키)
 # =============================
+
+# ⚠️ 핵심 수정: 여기서는 '안내용 seed multiselect'에 key="svc_filter_seed"를 사용합니다.
+# 업로드 후 실제 옵션으로 다시 만드는 동적 multiselect는 key="svc_filter_ms"로 별도 생성하여
+# StreamlitDuplicateElementKey 오류를 방지합니다.
 
 def render_sidebar_common():
     st.sidebar.title("📂 데이터 업로드")
     st.sidebar.file_uploader("filtered 시트가 포함된 병합 엑셀 업로드 (.xlsx)", type=["xlsx"], key="uploaded_file")
 
     st.sidebar.radio("# 📋 메뉴 선택", ["조달입찰결과현황", "내고객 분석하기"], key="menu")
+
+    # 안내용(초기) 서비스 필터 — 실제 필터는 업로드 후 데이터 컬럼 기반으로 다시 생성
+    st.sidebar.multiselect(
+        "서비스구분 선택 (업로드 전 임시)",
+        options=SERVICE_DEFAULT,
+        default=st.session_state.get("svc_filter_seed", SERVICE_DEFAULT),
+        key="svc_filter_seed",
+        help="엑셀 업로드 후 '서비스구분' 컬럼으로 실제 필터가 다시 생성됩니다.",
+    )
 
     with st.sidebar.expander("🔑 OpenAI API Key", expanded=True):
         keys = _get_api_keys_from_secrets()
@@ -638,8 +653,6 @@ def render_sidebar_common():
 
     st.session_state.setdefault("gpt_extra_req", "")
     st.sidebar.text_area("🤖 GPT 추가 요구사항(선택)", height=100, placeholder="예) 'MACsec, SRv6 강조', '세부 일정 표 추가' 등", key="gpt_extra_req")
-
-    st.sidebar.multiselect("서비스구분 선택", options=SERVICE_DEFAULT, default=SERVICE_DEFAULT, key="svc_filter_ms")
 
     st.title("📊 조달입찰 분석 시스템")
     st.caption("좌측에서 파일 업로드 후 메뉴를 선택하세요. ‘서비스구분’ 기본값은 전용회선/전화/인터넷입니다.")
@@ -670,12 +683,21 @@ except Exception as e:
 df_original = df.copy()
 
 # =============================
-# 동적 사이드바 필터 옵션
+# 동적 사이드바 필터 옵션 (업로드 후 실제 생성)
 # =============================
+
+# ⚠️ 여기서 실제 동적 multiselect를 key="svc_filter_ms"로 새로 만들기 때문에
+# 상단 seed(multiselect)와 key가 달라 충돌이 발생하지 않습니다.
 if "서비스구분" in df.columns:
     options = sorted([str(x) for x in df["서비스구분"].dropna().unique()])
-    defaults = [x for x in st.session_state.get("svc_filter_ms", []) if x in options] or [x for x in ["전용회선","전화","인터넷"] if x in options] or options[:3]
-    service_selected = st.sidebar.multiselect("서비스구분 선택", options=options, default=defaults, key="svc_filter_ms")
+    defaults = [x for x in st.session_state.get("svc_filter_seed", SERVICE_DEFAULT) if x in options] or \
+               [x for x in SERVICE_DEFAULT if x in options] or options[:3]
+    service_selected = st.sidebar.multiselect(
+        "서비스구분 선택",
+        options=options,
+        default=defaults,
+        key="svc_filter_ms",
+    )
 else:
     service_selected = []
 
@@ -980,6 +1002,9 @@ def render_basic_analysis_charts(base_df: pd.DataFrame):
         )
         st.plotly_chart(fig_bar, use_container_width=True)
 
+# ======= 여기까지 1/2 =======
+# ======= 2/2 시작 =======
+
 # =============================
 # 메뉴: 조달입찰결과현황 / 내고객 분석하기
 # =============================
@@ -1024,7 +1049,8 @@ elif menu_val == "내고객 분석하기":
     if customer_input:
         customers = [c.strip() for c in customer_input.split(",") if c.strip()]
         if customers:
-            result = df_original[df_original[demand_col].isin(customers)]
+            result = df_original[demand_col].isin(customers)
+            result = df_original[result]
             st.subheader(f"📊 검색 결과: {len(result)}건")
             if not result.empty:
                 rb = BytesIO(); result.to_excel(rb, index=False, engine="openpyxl"); rb.seek(0)
@@ -1054,10 +1080,10 @@ elif menu_val == "내고객 분석하기":
                             html = render_attachment_cards_html(attach_df, title_col)
                             st.markdown(html, unsafe_allow_html=True)
                         else:
-                            st.dataframe(attach_df.applymap(_strip_html))
+                            st.dataframe(attach_df.applymap(lambda x: '' if pd.isna(x) else re.sub(r"<[^>]+>", "", str(x))))
 
                         # Excel 저장은 HTML 제거 버전
-                        attach_df_text = attach_df.copy().applymap(_strip_html)
+                        attach_df_text = attach_df.copy().applymap(lambda x: '' if pd.isna(x) else re.sub(r"<[^>]+>", "", str(x)))
                         xbuf = BytesIO()
                         with pd.ExcelWriter(xbuf, engine="openpyxl") as writer:
                             attach_df_text.to_excel(writer, index=False, sheet_name="attachments")
@@ -1084,6 +1110,7 @@ elif menu_val == "내고객 분석하기":
                     "분석할 파일 업로드 (여러 개 가능)",
                     type=["pdf", "hwp", "hwpx", "doc", "docx", "ppt", "pptx", "xls", "xlsx", "txt", "csv", "md", "log"],
                     accept_multiple_files=True,
+                    key="src_files_uploader",
                 )
 
                 # 기존 보고서 노출/다운로드
@@ -1122,7 +1149,7 @@ elif menu_val == "내고객 분석하기":
                                 if not pbytes:
                                     continue
                                 st.download_button(
-                                    label=f"📥 {fname}", data=pbytes, file_name=_safe_filename(str(fname or f'converted_{i+1}.pdf')),
+                                    label=f"📥 {fname}", data=pbytes, file_name=f"{fname if str(fname).lower().endswith('.pdf') else (str(fname)+'.pdf')}",
                                     mime="application/pdf", key=f"dl_srcpdf_prev_{i}", use_container_width=True,
                                 )
                             except Exception:
@@ -1219,7 +1246,7 @@ elif menu_val == "내고객 분석하기":
                                                 if not pbytes:
                                                     continue
                                                 st.download_button(
-                                                    label=f"📥 {fname}", data=pbytes, file_name=_safe_filename(fname),
+                                                    label=f"📥 {fname}", data=pbytes, file_name=f"{fname if str(fname).lower().endswith('.pdf') else (str(fname)+'.pdf')}",
                                                     mime="application/pdf", key=f"dl_srcpdf_immediate_{i}", use_container_width=True,
                                                 )
                                     except Exception as e:
@@ -1286,3 +1313,5 @@ elif menu_val == "내고객 분석하기":
 # Pillow==10.4.0
 # python-docx==1.1.2   # (선택)
 # (시스템 패키지) unoconv / libreoffice / hwp5txt (서버 사전 설치 필요)
+
+# ======= 2/2 끝 =======
