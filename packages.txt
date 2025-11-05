@@ -1,0 +1,5 @@
+libreoffice
+unoconv
+python3-uno
+fonts-nanum
+fonts-noto-cjk
