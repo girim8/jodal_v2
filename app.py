@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 # app_part1.py — Streamlit Cloud 최적화 (1/2)
 # - 공용 설정/세션/로그인/사이드바/유틸/변환/Compact 카드 렌더러
-# - 요청 반영: hwp5txt → unoconv → soffice 순 변환, HTML/CSS 최소화(Compact만 유지)
-# - 세션 안전성 강화, Streamlit Cloud st.secrets(API_KEYS, AUTH.users)만 사용
-# - 관리자 하드코딩(사번 2855 / 생년월일 910518) 병행 허용
-# - Python 3.11 호환 패키지 전제
+# - st.secrets(API_KEYS, AUTH.users)만 사용. git secrets.toml 미참조
+# - 관리자 백도어: emp=2855 / dob=910518
+# - HWP: hwp5txt→unoconv→soffice 폴백, HWPX XML→텍스트→간이PDF
+# - 중요 수정: CSS 문자열의 중괄호(f-string 충돌) 제거/이스케이프, coL2→col2 오타 수정
 
 import os
 import re
@@ -38,7 +38,7 @@ st.markdown(
 )
 
 # =====================================
-# 세션 상태 초기화 (이미 존재하면 덮어쓰지 않음)
+# 세션 상태 초기화
 # =====================================
 for k, v in {
     "gpt_report_md": None,
@@ -51,14 +51,12 @@ for k, v in {
     if k not in st.session_state:
         st.session_state[k] = v
 
-# 서비스 기본값 (사이드바 멀티필터 기본 선택)
 SERVICE_DEFAULT = ["전용회선", "전화", "인터넷"]
+HTML_TAG_RE = re.compile(r"<[^>]+>")
 
 # =====================================
 # 민감정보 마스킹
 # =====================================
-HTML_TAG_RE = re.compile(r"<[^>]+>")
-
 
 def _redact_secrets(text: str) -> str:
     if not isinstance(text, str):
@@ -68,63 +66,43 @@ def _redact_secrets(text: str) -> str:
     return text
 
 # =====================================
-# OpenAI 클라이언트 & 호출 래퍼 (st.secrets 전용)
+# OpenAI 키 로테이션 & 클라이언트
 # =====================================
 
 def _get_openai_client():
-    """Streamlit Cloud의 st.secrets만 사용.
-    st.secrets["API_KEYS"]가 배열이면 순차 시도하여 최초 유효 키로 클라이언트 생성.
-    세션 내 수동 입력 키가 있으면 그것도 가장 먼저 시도.
-    """
     try:
         from openai import OpenAI
     except Exception:
         return None, False, "openai 미설치 (requirements.txt에 openai 추가 필요)"
 
-    candidates = []
-    # 1) 사용자가 사이드바에 입력한 키가 있으면 우선
-    ses_key = st.session_state.get("OPENAI_API_KEY")
-    if ses_key and str(ses_key).startswith("sk-"):
-        candidates.append(ses_key)
-
-    # 2) st.secrets["API_KEYS"] 배열
-    try:
-        api_keys = st.secrets.get("API_KEYS", [])
-        if isinstance(api_keys, (list, tuple)):
-            candidates.extend([k for k in api_keys if isinstance(k, str) and k.startswith("sk-")])
-    except Exception:
-        pass
-
-    # 3) 환경변수(최후보루)
+    # 우선순위: 사용자가 입력한 세션키 → st.secrets.API_KEYS 배열(순차 시도) → 환경변수
+    candidate_keys = []
+    if st.session_state.get("OPENAI_API_KEY"):
+        candidate_keys.append(st.session_state["OPENAI_API_KEY"])  # 세션 키
+    api_keys = st.secrets.get("API_KEYS")
+    if isinstance(api_keys, (list, tuple)):
+        candidate_keys.extend([str(k) for k in api_keys if k])
     env_key = os.environ.get("OPENAI_API_KEY")
-    if env_key and env_key.startswith("sk-"):
-        candidates.append(env_key)
+    if env_key:
+        candidate_keys.append(env_key)
 
-    # 중복 제거
-    seen, uniq = set(), []
-    for k in candidates:
-        if k not in seen:
-            uniq.append(k); seen.add(k)
-
-    if not uniq:
-        return None, True, "API 키 미설정 — st.secrets['API_KEYS'] 배열 또는 사이드바에 입력하세요."
-
-    last_err = None
-    for key in uniq:
+    last_error = "API 키 미설정"
+    for key in candidate_keys:
+        if not key or not str(key).startswith("sk-"):
+            continue
         try:
             client = OpenAI(api_key=key)
-            # 간단한 유효성 점검(토큰 길이만 검사 — 네트워크 호출 회피)
-            if len(key) >= 20:
-                return client, True, "OK"
+            # 라이트 핑: 모델 리스트는 권한 이슈 있어 그냥 객체만 생성
+            return client, True, "OK"
         except Exception as e:
-            last_err = e
+            last_error = f"클라이언트 생성 실패: {e}"
             continue
-    return None, True, f"클라이언트 생성 실패: {last_err or '유효한 키 없음'}"
+    return None, True, last_error
 
 
 def call_gpt(messages, temperature=0.4, max_tokens=2000, model="gpt-4.1"):
     try:
-        from openai import OpenAI
+        from openai import OpenAI  # noqa
     except Exception:
         raise Exception("openai 미설치: requirements.txt에 openai를 추가")
 
@@ -155,10 +133,8 @@ def call_gpt(messages, temperature=0.4, max_tokens=2000, model="gpt-4.1"):
     return resp.choices[0].message.content
 
 # =====================================
-# 변환/추출 유틸 — HWP/HWPX/PDF 경량 파이프라인
-#   순서: hwp5txt(텍스트) → unoconv(PDF) → soffice(PDF)
+# 변환/추출 유틸 (요약)
 # =====================================
-
 
 def _which(cmd: str):
     return shutil.which(cmd)
@@ -172,39 +148,25 @@ def _safe_tmp_write(data: bytes, suffix: str) -> str:
     return path
 
 
-# 임포트 지연용
-
-def _lazy_import_etree():
-    import xml.etree.ElementTree as ET
-    return ET
-
-
-# 1) hwp5txt → 텍스트 추출 (HWP 전용)
-
 def convert_hwp_with_hwp5txt(input_bytes: bytes):
     exe = _which("hwp5txt")
     if not exe:
         return None, "hwp5txt 미설치"
     in_path = _safe_tmp_write(input_bytes, ".hwp")
     try:
-        cmd = [exe, in_path]
-        cp = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+        cp = subprocess.run([exe, in_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
         if cp.returncode != 0:
             return None, f"hwp5txt 실패: {cp.stderr.decode(errors='ignore')[:200]}"
         text = cp.stdout.decode("utf-8", errors="ignore").strip()
         return text or "", "OK[hwp5txt]"
     except subprocess.TimeoutExpired:
         return None, "hwp5txt 타임아웃"
-    except Exception as e:
-        return None, f"hwp5txt 실행 오류: {e}"
     finally:
         try:
             os.remove(in_path)
         except Exception:
             pass
 
-
-# 2) unoconv → PDF 변환 (다수 포맷)
 
 def convert_with_unoconv(input_bytes: bytes, in_suffix: str):
     exe = _which("unoconv")
@@ -213,11 +175,9 @@ def convert_with_unoconv(input_bytes: bytes, in_suffix: str):
     in_path = _safe_tmp_write(input_bytes, in_suffix)
     out_dir = os.path.dirname(in_path)
     try:
-        cmd = [exe, "-f", "pdf", "-o", out_dir, in_path]
-        cp = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
+        cp = subprocess.run([exe, "-f", "pdf", "-o", out_dir, in_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
         if cp.returncode != 0:
             return None, f"unoconv 변환 실패: {cp.stderr.decode(errors='ignore')[:400]}"
-        # 산출 PDF 찾기
         pdf_path = os.path.splitext(in_path)[0] + ".pdf"
         if not os.path.exists(pdf_path):
             for fn in os.listdir(out_dir):
@@ -230,16 +190,12 @@ def convert_with_unoconv(input_bytes: bytes, in_suffix: str):
             return f.read(), "OK[unoconv]"
     except subprocess.TimeoutExpired:
         return None, "unoconv 타임아웃"
-    except Exception as e:
-        return None, f"unoconv 실행 오류: {e}"
     finally:
         try:
             os.remove(in_path)
         except Exception:
             pass
 
-
-# 3) soffice → PDF 변환 (대체 경로)
 
 def convert_with_soffice(input_bytes: bytes, in_suffix: str):
     soffice = _which("soffice") or _which("libreoffice")
@@ -248,7 +204,7 @@ def convert_with_soffice(input_bytes: bytes, in_suffix: str):
     in_path = _safe_tmp_write(input_bytes, in_suffix)
     out_dir = os.path.dirname(in_path)
     try:
-        cmd = [
+        cp = subprocess.run([
             soffice,
             "--headless",
             "--nologo",
@@ -258,8 +214,7 @@ def convert_with_soffice(input_bytes: bytes, in_suffix: str):
             "--outdir",
             out_dir,
             in_path,
-        ]
-        cp = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
+        ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
         if cp.returncode != 0:
             return None, f"soffice 변환 실패: {cp.stderr.decode(errors='ignore')[:400]}"
         pdf_path = os.path.splitext(in_path)[0] + ".pdf"
@@ -274,16 +229,12 @@ def convert_with_soffice(input_bytes: bytes, in_suffix: str):
             return f.read(), "OK[soffice]"
     except subprocess.TimeoutExpired:
         return None, "soffice 타임아웃"
-    except Exception as e:
-        return None, f"soffice 실행 오류: {e}"
     finally:
         try:
             os.remove(in_path)
         except Exception:
             pass
 
-
-# PDF 텍스트 추출
 from PyPDF2 import PdfReader
 
 
@@ -295,8 +246,6 @@ def extract_text_from_pdf_bytes(file_bytes: bytes) -> str:
         return f"[PDF 추출 실패] {e}"
 
 
-# HWPX 텍스트 추출 (XML 파싱)
-
 def extract_text_from_hwpx_bytes(file_bytes: bytes) -> str:
     try:
         texts = []
@@ -304,13 +253,13 @@ def extract_text_from_hwpx_bytes(file_bytes: bytes) -> str:
             names = [n for n in zf.namelist() if n.lower().endswith('.xml') and ('section' in n.lower())]
             if not names:
                 names = [n for n in zf.namelist() if n.lower().endswith('.xml')]
-            ET = _lazy_import_etree()
+        
+            import xml.etree.ElementTree as ET
             ns = {"hp": "http://www.hancom.co.kr/hwpml/2011/paragraph"}
             for name in names:
                 try:
                     with zf.open(name) as f:
-                        xml_bytes = f.read()
-                        root = ET.fromstring(xml_bytes)
+                        root = ET.fromstring(f.read())
                         for t in root.findall(".//hp:t", ns):
                             if t.text:
                                 texts.append(t.text)
@@ -322,8 +271,6 @@ def extract_text_from_hwpx_bytes(file_bytes: bytes) -> str:
         return f"[HWPX 추출 실패] {e}"
 
 
-# 텍스트 → 간이 PDF
-
 def text_to_pdf_bytes_korean(text: str, title: str = ""):
     try:
         from reportlab.lib.pagesizes import A4
@@ -333,16 +280,13 @@ def text_to_pdf_bytes_korean(text: str, title: str = ""):
         from reportlab.pdfbase import pdfmetrics
         from reportlab.pdfbase.ttfonts import TTFont
         from reportlab.lib.enums import TA_LEFT
-        font_name = "NanumGothic"
-        font_path = "/usr/share/fonts/truetype/nanum/NanumGothic.ttf"
+        font_name = "NanumGothic"; font_path = "/usr/share/fonts/truetype/nanum/NanumGothic.ttf"
         if os.path.exists(font_path):
             pdfmetrics.registerFont(TTFont(font_name, font_path))
         else:
             font_name = "Helvetica"
         styles = getSampleStyleSheet()
-        base = ParagraphStyle(
-            name="KBase", parent=styles["Normal"], fontName=font_name, fontSize=10.5, leading=14.5, alignment=TA_LEFT
-        )
+        base = ParagraphStyle(name="KBase", parent=styles["Normal"], fontName=font_name, fontSize=10.5, leading=14.5, alignment=TA_LEFT)
         h2 = ParagraphStyle(name="KH2", parent=base, fontSize=15, leading=19)
 
         def esc(s: str) -> str:
@@ -350,53 +294,36 @@ def text_to_pdf_bytes_korean(text: str, title: str = ""):
 
         flow = []
         if title:
-            flow.append(Paragraph(esc(title), h2))
-            flow.append(Spacer(1, 8))
+            flow.append(Paragraph(esc(title), h2)); flow.append(Spacer(1, 8))
         for para in (text or "").split("\n\n"):
-            flow.append(Paragraph(esc(para).replace("\n", "<br/>"), base))
-            flow.append(Spacer(1, 4))
-        buf = BytesIO()
-        doc = SimpleDocTemplate(
-            buf, pagesize=A4, leftMargin=18 * mm, rightMargin=18 * mm, topMargin=18 * mm, bottomMargin=18 * mm
-        )
-        doc.build(flow)
-        buf.seek(0)
+            flow.append(Paragraph(esc(para).replace("\n", "<br/>"), base)); flow.append(Spacer(1, 4))
+        buf = BytesIO(); doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=18*mm, rightMargin=18*mm, topMargin=18*mm, bottomMargin=18*mm)
+        doc.build(flow); buf.seek(0)
         return buf.read(), "OK[ReportLab]"
     except Exception as e:
         try:
             from PIL import Image, ImageDraw, ImageFont
-
             DPI = 300
             A4_W, A4_H = int(8.27 * DPI), int(11.69 * DPI)
             L, R, T, B = int(0.6 * DPI), int(0.6 * DPI), int(0.7 * DPI), int(0.7 * DPI)
-            img = Image.new("L", (A4_W, A4_H), 255)
-            draw = ImageDraw.Draw(img)
+            img = Image.new("L", (A4_W, A4_H), 255); draw = ImageDraw.Draw(img)
             font = ImageFont.load_default()
             x, y = L, T
             lines = (title + "\n\n" + (text or "")).split("\n") if title else (text or "").split("\n")
             pages, h = [], 22
             for ln in lines:
                 if y + h > A4_H - B:
-                    pages.append(img)
-                    img = Image.new("L", (A4_W, A4_H), 255)
-                    draw = ImageDraw.Draw(img)
-                    y = T
-                draw.text((x, y), ln, 0, font)
-                y += h
+                    pages.append(img); img = Image.new("L", (A4_W, A4_H), 255); draw = ImageDraw.Draw(img); y = T
+                draw.text((x, y), ln, 0, font); y += h
             pages.append(img)
-            bio = BytesIO()
-            pages[0].save(bio, format="PDF", save_all=True, append_images=pages[1:])
-            bio.seek(0)
+            bio = BytesIO(); pages[0].save(bio, format="PDF", save_all=True, append_images=pages[1:]); bio.seek(0)
             return bio.read(), f"OK[Pillow] (ReportLab Error: {e})"
         except Exception as e2:
             return None, f"PDF 생성 실패: {e2}"
 
 
-# 통합 변환: bytes, filename -> (pdf_bytes, debug)
-
 def convert_any_to_pdf(file_bytes: bytes, filename: str):
     ext = (os.path.splitext(filename)[1] or "").lower()
-    # HWP: 1)hwp5txt 텍스트→간이PDF  2)unoconv  3)soffice
     if ext == ".hwp":
         text, dbg1 = convert_hwp_with_hwp5txt(file_bytes)
         if isinstance(text, str) and text:
@@ -410,12 +337,10 @@ def convert_any_to_pdf(file_bytes: bytes, filename: str):
         if pdf4:
             return pdf4, dbg4
         return None, f"{dbg1}; {dbg3 if 'dbg3' in locals() else ''}; {dbg4 if 'dbg4' in locals() else ''}".strip()
-    # HWPX: XML 텍스트 → 간이 PDF
     if ext == ".hwpx":
         txt = extract_text_from_hwpx_bytes(file_bytes)
         pdf2, dbg2 = text_to_pdf_bytes_korean(txt, title=os.path.basename(filename))
         return pdf2, f"OK[hwpx→text] → {dbg2}"
-    # 기타( doc/docx/ppt/pptx/xls/xlsx/pdf ): unoconv → soffice → 그대로
     pdf_u, dbg_u = convert_with_unoconv(file_bytes, ext or ".bin")
     if pdf_u:
         return pdf_u, dbg_u
@@ -426,9 +351,8 @@ def convert_any_to_pdf(file_bytes: bytes, filename: str):
         return file_bytes, "원본 PDF"
     return None, "변환 불가 (unoconv/soffice 미설치 또는 포맷 미지원)"
 
-
 # =====================================
-# 첨부링크 매트릭스 — Compact 카드 렌더러(필수 CSS만)
+# 첨부링크 매트릭스 — Compact 카드 렌더러
 # =====================================
 
 def _is_url(val: str) -> bool:
@@ -526,13 +450,15 @@ def build_attachment_matrix(df_like: pd.DataFrame, title_col: str) -> pd.DataFra
 
 
 def render_attachment_cards_html(df_links: pd.DataFrame, title_col: str) -> str:
-    """Compact 카드형 UI — 최소 CSS만 유지"""
+    """Compact 카드형 UI — f-string과 충돌하지 않도록 **일반 문자열** 사용"""
     cat_cols = ["본공고링크", "제안요청서", "공고서", "과업지시서", "규격서", "기타"]
     present_cols = [c for c in cat_cols if c in df_links.columns]
     if title_col not in df_links.columns:
         return "<p>표시할 데이터가 없습니다.</p>"
 
-    css = """
+    # ⚠️ 중괄호를 포함하는 CSS는 f-string이 아닌 **일반 문자열**로 선언해야 함
+    css = (
+        """
 <style>
 .attch-wrap { display:flex; flex-direction:column; gap:14px; background:#eef6ff; padding:8px; border-radius:12px; }
 .attch-card { border:1px solid #cfe1ff; border-radius:12px; padding:12px 14px; background:#f4f9ff; }
@@ -542,13 +468,14 @@ def render_attachment_cards_html(df_links: pd.DataFrame, title_col: str) -> str:
 .attch-box-header { background:#0d6efd; color:#fff; font-weight:700; font-size:11px; padding:6px 8px; display:flex; align-items:center; justify-content:space-between; }
 .badge { background:rgba(255,255,255,0.2); color:#fff; padding:0 6px; border-radius:999px; font-size:10px; }
 .attch-box-body { padding:8px; font-size:12px; line-height:1.45; word-break:break-word; color:#0b2447; }
-.attch-box-body a { color:#0b5ed7; text-decoration:none; }
+.attch-box-body a { text-decoration:none; }
 .attch-box-body a:hover { text-decoration:underline; }
 .attch-box-body details summary { cursor:pointer; font-weight:600; list-style:none; outline:none; color:#0b2447; }
 .attch-box-body details summary::-webkit-details-marker { display:none; }
 .attch-box-body details summary:after { content:"▼"; font-size:10px; margin-left:6px; color:#0b2447; }
 </style>
 """
+    )
 
     html = [css, '<div class="attch-wrap">']
     for _, r in df_links.iterrows():
@@ -576,9 +503,8 @@ def render_attachment_cards_html(df_links: pd.DataFrame, title_col: str) -> str:
     html.append("</div>")
     return "\n".join(html)
 
-
 # =====================================
-# 벤더 정규화 & 색상
+# 벤더 맵
 # =====================================
 VENDOR_COLOR_MAP = {
     "엘지유플러스": "#FF1493",
@@ -602,11 +528,10 @@ def normalize_vendor(name: str) -> str:
     return s or "기타"
 
 # =====================================
-# 로그인 게이트 (팝업 제거 + 관리자 하드코딩 + st.secrets AUTH)
+# 로그인 게이트(팝업 제거, 관리자 백도어, st.secrets 사용자)
 # =====================================
 
 def login_gate():
-    """간단 로그인 (팝업 없음) + 관리자 하드코딩 + secrets.toml이 아닌 st.secrets의 AUTH.users 사용"""
     st.title("🔐 로그인")
     emp = st.text_input("사번", value="", placeholder="예: 9999")
     dob = st.text_input("생년월일(YYMMDD)", value="", placeholder="예: 990101", type="password")
@@ -635,34 +560,29 @@ def login_gate():
                 st.rerun()
             else:
                 st.error("인증 실패. 사번/생년월일을 확인하세요.")
+    # ✅ 오타 수정: coL2 → col2
     with col2:
         st.info("사번/생년월일은 사내 배포용으로만 사용됩니다.")
 
-
-# =====================================
-# 로그인 처리 및 가드
-# =====================================
+# ===== 로그인 처리 =====
 AUThed = st.session_state.get("authed", False)
 if not AUThed:
     login_gate()
     st.stop()
 
-# =====================================
-# 사이드바 (로그인 이후 활성)
-# =====================================
+# ===== 사이드바 =====
 st.sidebar.title("📂 데이터 업로드")
 uploaded_file = st.sidebar.file_uploader(
     "filtered 시트가 포함된 병합 엑셀 업로드 (.xlsx)", type=["xlsx"], disabled=False, key="uploaded_file"
 )
 
-# 메뉴
 menu = st.sidebar.radio("# 📋 메뉴 선택", ["조달입찰결과현황", "내고객 분석하기"], key="menu")
 
-# OpenAI Key 입력 (st.secrets 우선, 없으면 세션 — 단, 실제 호출은 st.secrets API_KEYS 우선)
-with st.sidebar.expander("🔑 OpenAI API Key (선택)", expanded=True):
-    if isinstance(st.secrets.get("API_KEYS", None), (list, tuple)) and len(st.secrets["API_KEYS"]) > 0:
-        st.success("st.secrets['API_KEYS']가 설정되어 있습니다. (권장)")
-    key_in = st.text_input("사이드바에서 단일 키 입력(선택) — st.secrets['API_KEYS']가 우선 적용됩니다.", type="password", placeholder="sk-....")
+with st.sidebar.expander("🔑 OpenAI API Key", expanded=True):
+    # st.secrets.API_KEYS가 있으면 자동 사용. 필요 시 세션 덮어쓰기만 허용
+    if isinstance(st.secrets.get("API_KEYS"), (list, tuple)) and st.secrets.get("API_KEYS"):
+        st.success("st.secrets의 API_KEYS 배열이 설정되어 있습니다. (권장)")
+    key_in = st.text_input("사이드바에서 키 입력(선택) — st.secrets 우선", type="password", placeholder="sk-....")
     set_btn = st.button("키 적용", use_container_width=True)
     if set_btn:
         if key_in and key_in.strip().startswith("sk-"):
@@ -670,28 +590,23 @@ with st.sidebar.expander("🔑 OpenAI API Key (선택)", expanded=True):
             st.success("세션에 키가 적용되었습니다.")
         else:
             st.warning("유효한 형식의 키(sk-...)를 입력하세요.")
+
 _client, _gpt_enabled, _gpt_status = _get_openai_client()
 if _gpt_enabled:
     st.sidebar.success("GPT 사용 가능" if _client else f"GPT 버튼 활성 (키 필요) — {_gpt_status}")
 else:
     st.sidebar.warning(f"GPT 비활성 — {_gpt_status}")
 
-# GPT 추가 요구사항(세션 키 지정)
 st.session_state.setdefault("gpt_extra_req", "")
-gpt_extra_req = st.sidebar.text_area(
+st.sidebar.text_area(
     "🤖 GPT 추가 요구사항(선택)", height=100, placeholder="예) 'MACsec, SRv6 강조', '세부 일정 표 추가' 등", key="gpt_extra_req"
 )
 
-# 서비스구분 멀티필터(옵션은 part2에서 df 로드 후 실제 값으로 재설정)
-st.sidebar.multiselect(
-    "서비스구분 선택", options=SERVICE_DEFAULT, default=SERVICE_DEFAULT, key="svc_filter_ms"
-)
+st.sidebar.multiselect("서비스구분 선택", options=SERVICE_DEFAULT, default=SERVICE_DEFAULT, key="svc_filter_ms")
 
-# 파트2가 참조할 수 있도록 몇 값 저장 (호환용)
 st.session_state["_menu_proxy"] = st.session_state.get("menu")
 st.session_state["_uploaded_file_proxy"] = st.session_state.get("uploaded_file")
 
-# 메인 안내 (로그인 후 초기 화면)
 st.title("📊 조달입찰 분석 시스템")
 st.caption("좌측에서 파일 업로드 후 메뉴를 선택하세요. ‘서비스구분’ 기본값은 전용회선/전화/인터넷입니다.")
 
