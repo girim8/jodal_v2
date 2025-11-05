@@ -367,32 +367,35 @@ def text_to_pdf_bytes_korean(text: str, title: str = ""):
 # 통합 변환 엔트리
 def convert_any_to_pdf(file_bytes: bytes, filename: str):
     ext = (os.path.splitext(filename)[1] or "").lower()
+
     if ext == ".hwp":
+        # 0) pyhwp 우선 시도 (설치/의존성 만족 시)
+        text_pyhwp, dbg_pyhwp = convert_hwp_with_pyhwp(file_bytes)
+        if isinstance(text_pyhwp, str) and text_pyhwp:
+            pdf2, dbg2 = text_to_pdf_bytes_korean(text_pyhwp, title=os.path.basename(filename))
+            if pdf2:
+                return pdf2, f"{dbg_pyhwp} → {dbg2}"
+
+        # 1) hwp5txt 시도
         text, dbg1 = convert_hwp_with_hwp5txt(file_bytes)
         if isinstance(text, str) and text:
             pdf2, dbg2 = text_to_pdf_bytes_korean(text, title=os.path.basename(filename))
             if pdf2:
                 return pdf2, f"{dbg1} → {dbg2}"
+
+        # 2) unoconv 시도 (대부분 distutils 문제로 실패 가능)
         pdf3, dbg3 = convert_with_unoconv(file_bytes, ext)
         if pdf3:
             return pdf3, dbg3
+
+        # 3) soffice 직접 시도 (서버에 LibreOffice가 있으면 성공)
         pdf4, dbg4 = convert_with_soffice(file_bytes, ext)
         if pdf4:
             return pdf4, dbg4
-        return None, f"{dbg1}; {dbg3 if 'dbg3' in locals() else ''}; {dbg4 if 'dbg4' in locals() else ''}".strip()
-    if ext == ".hwpx":
-        txt = extract_text_from_hwpx_bytes(file_bytes)
-        pdf2, dbg2 = text_to_pdf_bytes_korean(txt, title=os.path.basename(filename))
-        return pdf2, f"OK[hwpx→text] → {dbg2}"
-    pdf_u, dbg_u = convert_with_unoconv(file_bytes, ext or ".bin")
-    if pdf_u:
-        return pdf_u, dbg_u
-    pdf_s, dbg_s = convert_with_soffice(file_bytes, ext or ".bin")
-    if pdf_s:
-        return pdf_s, dbg_s
-    if ext == ".pdf":
-        return file_bytes, "원본 PDF"
-    return None, "변환 불가 (unoconv/soffice 미설치 또는 포맷 미지원)"
+
+        # 모두 실패
+        reasons = " / ".join([dbg_pyhwp or "", dbg1 or "", dbg3 or "", dbg4 or ""]).strip(" /")
+        return None, f"HWP 변환 실패: {reasons or '원인 미상'}"
 
 # =============================
 # 첨부 링크 매트릭스 (Compact 카드 UI)
