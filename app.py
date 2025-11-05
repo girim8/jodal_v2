@@ -600,14 +600,6 @@ def render_sidebar_common():
     st.sidebar.radio("# 📋 메뉴 선택", ["조달입찰결과현황", "내고객 분석하기"], key="menu")
 
     # 안내용 seed — 업로드 후 실제 multiselect는 다른 key로 생성
-    st.sidebar.multiselect(
-        "서비스구분 선택 (업로드 전 임시)",
-        options=SERVICE_DEFAULT,
-        default=st.session_state.get("svc_filter_seed", SERVICE_DEFAULT),
-        key="svc_filter_seed",
-        help="엑셀 업로드 후 '서비스구분' 컬럼으로 실제 필터가 다시 생성됩니다.",
-    )
-
     with st.sidebar.expander("🔑 OpenAI API Key", expanded=True):
         keys = _get_api_keys_from_secrets()
         if keys:
