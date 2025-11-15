@@ -1,12 +1,7 @@
-
 python3-uno
 fonts-noto-cjk
-# HWP/HWPX → PDF 변환용
 libreoffice
 unoconv
-# PDF 추출·렌더링 보조
 poppler-utils
-# 한글 폰트
 fonts-nanum
-# (선택) 이미지 매니퓰레이션 일부가 필요하면
 imagemagick

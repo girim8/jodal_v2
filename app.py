@@ -30,6 +30,8 @@ import pandas as pd
 import numpy as np
 import plotly.express as px
 
+from hwp_utils import convert_hwp_local_to_text
+
 # =============================
 # 전역/메타
 # =============================
@@ -67,7 +69,7 @@ def _redact_secrets(text: str) -> str:
     if not isinstance(text, str):
         return text
     text = re.sub(r"sk-[A-Za-z0-9_\-]{20,}", "[REDACTED_KEY]", text)
-    text = re.sub(r'(?i)\b(gpt_api_key|OPENAI_API_KEY|CLOUDCONVERT_API_KEY)\s*=\s*([\'\"]) .*? \2', r'\1=\2[REDACTED]\2', text)
+    text = re.sub(r'(?i)\b(gpt_api_key|OPENAI_API_KEY|CLOUDCONVERT_API_KEY)\s*=\s*([\'\"])\s*[^\'\"]*\2', r'\1=\2[REDACTED]\2', text)
     return text
 
 # =============================
@@ -413,18 +415,24 @@ def text_to_pdf_bytes_korean(text: str, title: str = ""):
 # =============================
 ALLOWED_UPLOAD_EXTS = {".pdf",".hwp",".hwpx",".doc",".docx",".ppt",".pptx",".xls",".xlsx",".txt",".csv",".md",".log"}
 
-def convert_any_to_pdf(file_bytes: bytes, filename: str) -> tuple[bytes | None, str]:
+def convert_any_to_pdf(file_bytes: bytes, filename: str) -> tuple[bytes | None, str, str | None]:
     ext = (os.path.splitext(filename)[1] or "").lower()
 
-    # 1) HWP (로컬)
+    # 1) HWP (로컬 → pyhwp/hwp5txt → CloudConvert)
     if ext == ".hwp":
+        text_local, dbg_local = convert_hwp_local_to_text(file_bytes)
+        if text_local:
+            pdf, dbg_pdf = text_to_pdf_bytes_korean(text_local, title=os.path.basename(filename))
+            if pdf:
+                return pdf, f"{dbg_local} → {dbg_pdf}", text_local
         t, dbg = convert_hwp_with_pyhwp(file_bytes)
         if t:
             pdf, dbg2 = text_to_pdf_bytes_korean(t, title=os.path.basename(filename))
             if pdf:
-                return pdf, f"{dbg} → {dbg2}"
-        # 2) CloudConvert
-        return cloudconvert_convert_to_pdf(file_bytes, filename)
+                return pdf, f"{dbg} → {dbg2}", t
+        # 3) CloudConvert
+        pdf, status = cloudconvert_convert_to_pdf(file_bytes, filename)
+        return pdf, status, None
 
     # 1) HWPX (로컬 텍스트)
     if ext == ".hwpx":
@@ -432,16 +440,18 @@ def convert_any_to_pdf(file_bytes: bytes, filename: str) -> tuple[bytes | None, 
         if t and not t.startswith("[HWPX 추출 실패]"):
             pdf, dbg2 = text_to_pdf_bytes_korean(t, title=os.path.basename(filename))
             if pdf:
-                return pdf, dbg2
+                return pdf, dbg2, t
         # 2) CloudConvert
-        return cloudconvert_convert_to_pdf(file_bytes, filename)
+        pdf, status = cloudconvert_convert_to_pdf(file_bytes, filename)
+        return pdf, status, None
 
     # PDF는 그대로
     if ext == ".pdf":
-        return file_bytes, "이미 PDF"
+        return file_bytes, "이미 PDF", None
 
     # 나머지 형식은 CloudConvert 1회 시도
-    return cloudconvert_convert_to_pdf(file_bytes, filename)
+    pdf, status = cloudconvert_convert_to_pdf(file_bytes, filename)
+    return pdf, status, None
 
 # =============================
 # 첨부 링크 매트릭스 (Compact 카드 UI)
@@ -979,8 +989,7 @@ def render_basic_analysis_charts(base_df: pd.DataFrame):
             grp = grp.sort_values(["연", "분", group_col]).reset_index(drop=True)
             ordered_quarters = grp.sort_values(["연", "분"])["연도분기"].unique()
             grp["연도분기"] = pd.Categorical(grp["연도분기"], categories=ordered_quarters, ordered=True)
-            import numpy as _np
-            custom = _np.column_stack([grp[group_col].astype(str).to_numpy(), grp["입찰공고목록"].astype(str).to_numpy()])
+            custom = np.column_stack([grp[group_col].astype(str).to_numpy(), grp["입찰공고목록"].astype(str).to_numpy()])
             fig_stack = px.bar(
                 grp,
                 x="연도분기",
@@ -1000,7 +1009,11 @@ def render_basic_analysis_charts(base_df: pd.DataFrame):
                     "입찰공고명: %{{customdata[1]}}"
                 ),
             )
-            fig_stack.update_layout(xaxis_title="연도분기", yaxis_title="배정예산금액 (원)", margin=dict(l=10, r=10, t=60, b=10))
+            fig_stack.update_layout(
+                xaxis_title="연도분기",
+                yaxis_title="배정예산금액 (원)",
+                margin=dict(l=10, r=10, t=60, b=10),
+            )
             st.plotly_chart(fig_stack, use_container_width=True)
         else:
             st.info("그룹핑 결과가 비어 있습니다.")
@@ -1015,11 +1028,9 @@ def render_basic_analysis_charts(base_df: pd.DataFrame):
                 .apply(lambda s: " | ".join(pd.Series(s).dropna().astype(str).unique()[:10]))
                 .reindex(grp_total["연도분기"]).fillna("")
             )
-            import numpy as _np
-            custom2 = _np.stack([titles_total], axis=-1)
+            custom2 = np.array(titles_total.astype(str).to_list()).reshape(-1, 1)
         else:
-            import numpy as _np
-            custom2 = _np.stack([pd.Series([""])], axis=-1)
+            custom2 = np.array(["" for _ in range(len(grp_total))]).reshape(-1, 1)
         fig_bar = px.bar(grp_total, x="연도분기", y="금액합", title="연·분기별 배정예산금액 (총합)", text="금액합")
         fig_bar.update_traces(
             customdata=custom2,
@@ -1190,12 +1201,26 @@ elif menu_val == "내고객 분석하기":
                                         data = f.read()
                                         ext = (os.path.splitext(name)[1] or "").lower()
                                         if ext in [".pdf", ".hwp", ".hwpx", ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx"]:
-                                            pdf_bytes, dbg = convert_any_to_pdf(data, name)
+                                            pdf_bytes, dbg, plain_text = convert_any_to_pdf(data, name)
+                                            safe_label = os.path.splitext(name)[0] + ".pdf"
+                                            if plain_text:
+                                                redact = _redact_secrets(plain_text)
+                                                convert_logs.append(
+                                                    f"📝 {name}: 로컬 텍스트 추출 성공 ({len(redact)} chars)"
+                                                )
+                                                combined_texts.append(
+                                                    f"\n\n===== [{name} → TEXT] =====\n{redact}\n"
+                                                )
                                             if pdf_bytes:
-                                                generated_pdfs.append((os.path.splitext(name)[0] + ".pdf", pdf_bytes))
+                                                generated_pdfs.append((safe_label, pdf_bytes))
                                                 txt = extract_text_from_pdf_bytes(pdf_bytes)
-                                                convert_logs.append(f"✅ {name} → PDF 변환 성공 ({dbg}), 텍스트 {len(txt)} chars")
-                                                combined_texts.append(f"\n\n===== [{name} → PDF] =====\n{_redact_secrets(txt)}\n")
+                                                convert_logs.append(
+                                                    f"✅ {name} → PDF 변환 성공 ({dbg}), 텍스트 {len(txt)} chars"
+                                                )
+                                                if txt.strip():
+                                                    combined_texts.append(
+                                                        f"\n\n===== [{name} → PDF] =====\n{_redact_secrets(txt)}\n"
+                                                    )
                                             else:
                                                 convert_logs.append(f"🛑 {name}: PDF 변환 실패 ({dbg})")
                                         elif ext in [".txt", ".csv", ".md", ".log"]:
