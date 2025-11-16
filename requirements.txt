@@ -5,6 +5,7 @@ plotly==5.24.1
 openpyxl==3.1.5
 xlrd==2.0.1
 XlsxWriter==3.2.0
+openai==1.55.3
 
 # 웹/크롤/파서 유틸
 requests==2.32.3
