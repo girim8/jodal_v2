@@ -37,3 +37,13 @@ pytest
 ## 5. Troubleshooting
 - Streamlit Cloud에서 "Your app is in the oven"이 오래 지속된다면 빌드 로그를 확인하고 `requirements.txt`/`packages.txt`의 설치 여부를 먼저 살펴보세요.
 - HWP 추출이 의심될 때는 `scripts/hwp_inspector.py`로 동일 파일을 로컬에서 확인한 뒤 `tests/test_hwp_conversion.py`의 skip 조건을 만족하도록 샘플 파일을 배치하면 됩니다.
+
+## 6. PR 체크리스트 한 번에 실행하기
+CI 대신 로컬에서 PR 제출 전 동일한 절차를 돌려보고 싶다면 아래 스크립트를 실행하세요.
+
+```bash
+./scripts/pr_check.sh
+```
+
+- `python -m compileall`, `pytest`를 순차 실행합니다.
+- 저장소 루트에 샘플 HWP가 있으면 `scripts/hwp_inspector.py --fail-missing`까지 자동 수행해 키워드 검증도 끝냅니다.
