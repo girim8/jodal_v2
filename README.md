@@ -9,9 +9,9 @@
    pip install -r requirements.txt
    ```
    - 문서 변환에 실제로 사용되는 라이브러리만 남겼기 때문에(예: PyPDF2, reportlab, Pillow, olefile) `pip install` 시간이 이전 대비 크게 단축되었습니다.
-3. (Streamlit Cloud) `packages.txt`에는 한글 폰트만 남겼습니다(`fonts-noto-cjk`, `fonts-nanum`). LibreOffice/Poppler 등 대용량 패키지를 모두 제거했으므로 빌드가 수 분씩 지연되던 문제가 해소됩니다.
+3. (Streamlit Cloud) `packages.txt`를 **완전히 제거**했으므로 apt 단계 자체가 실행되지 않습니다. 이제 "Your app is in the oven" 상태가 apt 설치 때문에 길어질 일이 없습니다.
 
-> 📁 **폰트 직접 번들링도 가능** — `assets/fonts/NanumGothic.ttf` 또는 `assets/fonts/NanumGothic-Regular.ttf`를 추가해 두면 apt 설치 없이도 `text_to_pdf_bytes_korean`이 해당 폰트를 우선 사용합니다.
+> 📁 **폰트 직접 번들링도 가능** — `assets/fonts/NanumGothic.ttf` 또는 `assets/fonts/NanumGothic-Regular.ttf`를 추가하면 ReportLab이 우선 사용합니다. 폰트를 추가하지 않아도 새로 추가된 CID 폰트(Adobe-Korea1 기반)로 한국어가 정상 표기됩니다.
 
 ## 2. 앱 실행
 ```bash
@@ -38,7 +38,7 @@ pytest
 - OLE BodyText 파서를 이용한 단위 테스트와(필수 키워드 `계약`, `번호`) 샘플 HWP 파일이 있을 경우의 통합 테스트를 모두 커버합니다.
 
 ## 5. Troubleshooting
-- Streamlit Cloud에서 "Your app is in the oven"이 오래 지속된다면, `pip install` 단계에서 설치되는 패키지 수가 크게 줄어든 최신 `requirements.txt`가 반영됐는지와, apt 단계가 폰트 2종만 설치하도록 된 최신 `packages.txt`가 배포됐는지를 먼저 확인하세요.
+- Streamlit Cloud에서 "Your app is in the oven"이 오래 지속된다면, `pip install` 단계에서 설치되는 패키지 수가 크게 줄어든 최신 `requirements.txt`가 반영됐는지와, 저장소 루트에 **`packages.txt`가 없는지**(apt 단계 완전 생략)를 먼저 확인하세요.
 - HWP 추출이 의심될 때는 `scripts/hwp_inspector.py`로 동일 파일을 로컬에서 확인한 뒤 `tests/test_hwp_conversion.py`의 skip 조건을 만족하도록 샘플 파일을 배치하면 됩니다.
 
 ## 6. PR 체크리스트 한 번에 실행하기

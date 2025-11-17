@@ -80,6 +80,31 @@ def _pick_korean_font_path() -> str | None:
             return str(candidate)
     return None
 
+
+@lru_cache(maxsize=1)
+def _resolve_pdf_font_name() -> str:
+    try:
+        from reportlab.pdfbase import pdfmetrics
+        from reportlab.pdfbase.ttfonts import TTFont
+    except Exception:
+        return "Helvetica"
+
+    local_font = _pick_korean_font_path()
+    if local_font:
+        try:
+            pdfmetrics.registerFont(TTFont("NanumGothic", local_font))
+            return "NanumGothic"
+        except Exception:
+            pass
+
+    try:
+        from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+        fallback = "HYGoThic-Medium"
+        pdfmetrics.registerFont(UnicodeCIDFont(fallback))
+        return fallback
+    except Exception:
+        return "Helvetica"
+
 # =============================
 # 민감정보 마스킹
 # =============================
@@ -384,18 +409,8 @@ def text_to_pdf_bytes_korean(text: str, title: str = ""):
         from reportlab.lib.units import mm
         from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
         from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-        from reportlab.pdfbase import pdfmetrics
-        from reportlab.pdfbase.ttfonts import TTFont
         from reportlab.lib.enums import TA_LEFT
-        font_name = "NanumGothic"
-        font_path = _pick_korean_font_path()
-        if font_path:
-            try:
-                pdfmetrics.registerFont(TTFont(font_name, font_path))
-            except Exception:
-                font_name = "Helvetica"
-        else:
-            font_name = "Helvetica"
+        font_name = _resolve_pdf_font_name()
         styles = getSampleStyleSheet()
         base = ParagraphStyle(name="KBase", parent=styles["Normal"], fontName=font_name, fontSize=10.5, leading=14.5, alignment=TA_LEFT)
         h2 = ParagraphStyle(name="KH2", parent=base, fontSize=15, leading=19)
