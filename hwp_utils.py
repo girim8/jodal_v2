@@ -8,6 +8,9 @@ import zlib
 from typing import Iterable, Sequence
 
 
+DEFAULT_KEYWORDS: tuple[str, str, str] = ("계약", "번호", "금액")
+
+
 def _parse_hwp_records(data: bytes) -> str:
     texts: list[str] = []
     offset = 0
@@ -142,7 +145,7 @@ def contains_korean(text: str) -> bool:
 
 def collect_text_statistics(
     text: str | None,
-    keywords: Sequence[str] | None = None,
+    keywords: Sequence[str] | None = DEFAULT_KEYWORDS,
 ) -> dict[str, object]:
     """Return quick stats for debugging/CLI usage."""
 

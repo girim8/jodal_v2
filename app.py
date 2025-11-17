@@ -34,6 +34,7 @@ except ImportError as _plotly_exc:  # Streamlit Cloud에서 plotly 미설치 시
     _PLOTLY_IMPORT_ERROR = str(_plotly_exc)
 
 from hwp_utils import (
+    DEFAULT_KEYWORDS,
     collect_text_statistics,
     convert_hwp_local_to_text,
     extract_text_from_hwpx_bytes,
@@ -69,7 +70,7 @@ for k, v in {
 SERVICE_DEFAULT = ["전용회선", "전화", "인터넷"]
 HTML_TAG_RE = re.compile(r"<[^>]+>")
 BASE_DIR = Path(__file__).resolve().parent
-QUALITY_KEYWORDS = ("계약", "번호", "스쿨넷", "추정금액", "이중화", "Aggregation")
+QUALITY_KEYWORDS = DEFAULT_KEYWORDS
 FONT_SEARCH_PATHS = (
     BASE_DIR / "assets" / "fonts" / "NanumGothic.ttf",
     BASE_DIR / "assets" / "fonts" / "NanumGothic-Regular.ttf",

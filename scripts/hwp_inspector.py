@@ -7,8 +7,7 @@ import sys
 from pathlib import Path
 
 import hwp_utils
-
-DEFAULT_KEYWORDS = ("계약", "번호", "스쿨넷", "추정금액", "이중화", "Aggregation")
+from hwp_utils import DEFAULT_KEYWORDS
 
 
 def _read_bytes(path: Path) -> bytes:

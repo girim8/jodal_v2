@@ -86,3 +86,8 @@ def test_sample_hwp_contains_keywords():
     assert text, f"텍스트 추출 실패: {status}"
     for keyword in ("계약", "번호"):
         assert keyword in text
+    assert "금액" not in text
+
+    stats = hwp_utils.collect_text_statistics(text, hwp_utils.DEFAULT_KEYWORDS)
+    assert stats["found_keywords"] == ["계약", "번호"]
+    assert stats["missing_keywords"] == ["금액"]
