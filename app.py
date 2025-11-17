@@ -30,7 +30,12 @@ from datetime import datetime
 import streamlit as st
 import pandas as pd
 import numpy as np
-import plotly.express as px
+try:
+    import plotly.express as px
+    _PLOTLY_IMPORT_ERROR = ""
+except ImportError as _plotly_exc:  # Streamlit Cloud에서 plotly 미설치 시 대비
+    px = None
+    _PLOTLY_IMPORT_ERROR = str(_plotly_exc)
 
 from hwp_utils import convert_hwp_local_to_text
 
@@ -731,7 +736,14 @@ from datetime import datetime
 import pandas as pd
 import numpy as np
 import streamlit as st
-import plotly.express as px
+
+if 'px' not in globals() or px is None:  # 상단 병합형 스크립트 호환성 유지
+    try:
+        import plotly.express as px
+        _PLOTLY_IMPORT_ERROR = ""
+    except ImportError as _plotly_exc:
+        px = None
+        _PLOTLY_IMPORT_ERROR = str(_plotly_exc)
 
 # =============================
 # 업로드/데이터 로드
@@ -839,6 +851,13 @@ def markdown_to_pdf_korean(md_text: str, title: str | None = None):
 from math import isfinite
 
 def render_basic_analysis_charts(base_df: pd.DataFrame):
+    if px is None:
+        warn_msg = "Plotly 미설치로 차트 기능이 비활성화되었습니다. requirements.txt를 설치해주세요."
+        if _PLOTLY_IMPORT_ERROR:
+            warn_msg += f" (원인: {_PLOTLY_IMPORT_ERROR})"
+        st.warning(warn_msg)
+        return
+
     def pick_unit(max_val: float):
         if max_val >= 1_0000_0000_0000:
             return ("조원", 1_0000_0000_0000)
