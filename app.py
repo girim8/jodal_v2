@@ -17,6 +17,8 @@ import json
 import base64
 import zipfile
 import shutil
+from functools import lru_cache
+from pathlib import Path
 import requests
 import tempfile
 import subprocess
@@ -61,6 +63,22 @@ for k, v in {
 
 SERVICE_DEFAULT = ["전용회선", "전화", "인터넷"]
 HTML_TAG_RE = re.compile(r"<[^>]+>")
+BASE_DIR = Path(__file__).resolve().parent
+FONT_SEARCH_PATHS = (
+    BASE_DIR / "assets" / "fonts" / "NanumGothic.ttf",
+    BASE_DIR / "assets" / "fonts" / "NanumGothic-Regular.ttf",
+    Path("/usr/share/fonts/truetype/nanum/NanumGothic.ttf"),
+    Path("/usr/share/fonts/truetype/nanum/NanumGothic-Regular.ttf"),
+    Path("/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc"),
+)
+
+
+@lru_cache(maxsize=1)
+def _pick_korean_font_path() -> str | None:
+    for candidate in FONT_SEARCH_PATHS:
+        if candidate.exists():
+            return str(candidate)
+    return None
 
 # =============================
 # 민감정보 마스킹
@@ -369,9 +387,13 @@ def text_to_pdf_bytes_korean(text: str, title: str = ""):
         from reportlab.pdfbase import pdfmetrics
         from reportlab.pdfbase.ttfonts import TTFont
         from reportlab.lib.enums import TA_LEFT
-        font_name = "NanumGothic"; font_path = "/usr/share/fonts/truetype/nanum/NanumGothic.ttf"
-        if os.path.exists(font_path):
-            pdfmetrics.registerFont(TTFont(font_name, font_path))
+        font_name = "NanumGothic"
+        font_path = _pick_korean_font_path()
+        if font_path:
+            try:
+                pdfmetrics.registerFont(TTFont(font_name, font_path))
+            except Exception:
+                font_name = "Helvetica"
         else:
             font_name = "Helvetica"
         styles = getSampleStyleSheet()
