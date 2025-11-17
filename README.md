@@ -7,10 +7,8 @@
 2. 의존성 설치
    ```bash
    pip install -r requirements.txt
-   # (선택) 대시보드용 Plotly 차트가 필요하면 아래 한 줄만 추가
-   pip install plotly==5.24.1
    ```
-   - requirements.txt에는 순수 파이썬으로 동작하는 최소 구성만 남겨 두었습니다. libreoffice, unoconv, openjdk 같은 대용량 apt 패키지를 설치할 필요가 없습니다.
+   - Plotly까지 포함된 순수 파이썬 패키지 조합만 사용하므로, libreoffice·unoconv·openjdk 같은 대용량 apt 패키지를 설치할 필요가 없습니다.
 3. (Streamlit Cloud) `packages.txt`를 **완전히 제거**했으므로 apt 단계 자체가 실행되지 않습니다. 이제 "Your app is in the oven" 상태가 apt 설치 때문에 길어질 일이 없습니다.
 
 > 📁 **폰트 직접 번들링도 가능** — `assets/fonts/NanumGothic.ttf` 또는 `assets/fonts/NanumGothic-Regular.ttf`를 추가하면 ReportLab이 우선 사용합니다. 폰트를 추가하지 않아도 새로 추가된 CID 폰트(Adobe-Korea1 기반)로 한국어가 정상 표기됩니다.
@@ -18,7 +16,7 @@
 ### 왜 이렇게 가벼워졌나요?
 - HWP/HWPX는 `hwp_utils.py`가 직접 레코드를 파싱하며, `pyhwp`, `unoconv`, `libreoffice` 등의 외부 프로그램을 설치하지 않아도 됩니다.
 - PDF 생성을 제외하면 Pillow/ReportLab 외에는 시스템 폰트조차 요구하지 않습니다. 필요한 경우 `assets/fonts`에 폰트를 복사하면 끝입니다.
-- Plotly는 옵션입니다. 설치하지 않으면 차트 섹션에서 경고만 출력하고 앱은 정상 기동합니다.
+- Plotly가 requirements에 기본 포함되어 차트까지 바로 사용 가능합니다. (만약 직접 지웠다면 차트 영역에서 경고만 표시됩니다.)
 
 ## 2. 앱 실행
 ```bash
