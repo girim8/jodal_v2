@@ -15,11 +15,9 @@ import re
 import io
 import json
 import base64
-import zipfile
-import shutil
+from functools import lru_cache
+from pathlib import Path
 import requests
-import tempfile
-import subprocess
 from io import BytesIO
 from urllib.parse import urlparse, unquote
 from textwrap import dedent
@@ -28,7 +26,18 @@ from datetime import datetime
 import streamlit as st
 import pandas as pd
 import numpy as np
-import plotly.express as px
+try:
+    import plotly.express as px
+    _PLOTLY_IMPORT_ERROR = ""
+except ImportError as _plotly_exc:  # Streamlit Cloud에서 plotly 미설치 시 대비
+    px = None
+    _PLOTLY_IMPORT_ERROR = str(_plotly_exc)
+
+from hwp_utils import (
+    collect_text_statistics,
+    convert_hwp_local_to_text,
+    extract_text_from_hwpx_bytes,
+)
 
 # =============================
 # 전역/메타
@@ -59,6 +68,48 @@ for k, v in {
 
 SERVICE_DEFAULT = ["전용회선", "전화", "인터넷"]
 HTML_TAG_RE = re.compile(r"<[^>]+>")
+BASE_DIR = Path(__file__).resolve().parent
+QUALITY_KEYWORDS = ("계약", "번호", "스쿨넷", "추정금액", "이중화", "Aggregation")
+FONT_SEARCH_PATHS = (
+    BASE_DIR / "assets" / "fonts" / "NanumGothic.ttf",
+    BASE_DIR / "assets" / "fonts" / "NanumGothic-Regular.ttf",
+    Path("/usr/share/fonts/truetype/nanum/NanumGothic.ttf"),
+    Path("/usr/share/fonts/truetype/nanum/NanumGothic-Regular.ttf"),
+    Path("/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc"),
+)
+
+
+@lru_cache(maxsize=1)
+def _pick_korean_font_path() -> str | None:
+    for candidate in FONT_SEARCH_PATHS:
+        if candidate.exists():
+            return str(candidate)
+    return None
+
+
+@lru_cache(maxsize=1)
+def _resolve_pdf_font_name() -> str:
+    try:
+        from reportlab.pdfbase import pdfmetrics
+        from reportlab.pdfbase.ttfonts import TTFont
+    except Exception:
+        return "Helvetica"
+
+    local_font = _pick_korean_font_path()
+    if local_font:
+        try:
+            pdfmetrics.registerFont(TTFont("NanumGothic", local_font))
+            return "NanumGothic"
+        except Exception:
+            pass
+
+    try:
+        from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+        fallback = "HYGoThic-Medium"
+        pdfmetrics.registerFont(UnicodeCIDFont(fallback))
+        return fallback
+    except Exception:
+        return "Helvetica"
 
 # =============================
 # 민감정보 마스킹
@@ -67,7 +118,7 @@ def _redact_secrets(text: str) -> str:
     if not isinstance(text, str):
         return text
     text = re.sub(r"sk-[A-Za-z0-9_\-]{20,}", "[REDACTED_KEY]", text)
-    text = re.sub(r'(?i)\b(gpt_api_key|OPENAI_API_KEY|CLOUDCONVERT_API_KEY)\s*=\s*([\'\"]) .*? \2', r'\1=\2[REDACTED]\2', text)
+    text = re.sub(r'(?i)\b(gpt_api_key|OPENAI_API_KEY|CLOUDCONVERT_API_KEY)\s*=\s*([\'\"])\s*[^\'\"]*\2', r'\1=\2[REDACTED]\2', text)
     return text
 
 # =============================
@@ -297,81 +348,14 @@ def extract_text_from_pdf_bytes(file_bytes: bytes) -> str:
         return f"[PDF 추출 실패] {e}"
 
 
-def convert_hwp_with_pyhwp(file_bytes: bytes):
-    """pyhwp 또는 hwp5txt를 통해 텍스트를 얻는다."""
-    # 1) pyhwp 파이썬 모듈
-    try:
-        import importlib
-        has_pyhwp = importlib.util.find_spec("pyhwp") is not None
-        if has_pyhwp:
-            try:
-                import pyhwp
-                from pyhwp.hwp5.dataio import HWP5File
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".hwp") as tmp:
-                    tmp.write(file_bytes)
-                    path = tmp.name
-                try:
-                    doc = HWP5File(path)
-                    text = doc.text
-                    return (text or "").strip(), "OK[pyhwp]"
-                finally:
-                    try: os.unlink(path)
-                    except Exception: pass
-            except Exception as e:
-                pass
-    except Exception:
-        pass
-    # 2) hwp5txt CLI
-    try:
-        exe = shutil.which("hwp5txt") or shutil.which("hwp5txt.py")
-        if exe:
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".hwp") as tmp:
-                tmp.write(file_bytes)
-                path = tmp.name
-            try:
-                cp = subprocess.run([exe, path], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
-                if cp.returncode == 0:
-                    return cp.stdout.decode("utf-8", errors="ignore"), "OK[hwp5txt]"
-            finally:
-                try: os.unlink(path)
-                except Exception: pass
-    except Exception:
-        pass
-    return None, "pyhwp/hwp5txt 텍스트 추출 실패"
-
-
-def extract_text_from_hwpx_bytes(file_bytes: bytes) -> str:
-    try:
-        texts = []
-        with zipfile.ZipFile(BytesIO(file_bytes)) as zf:
-            xmls = [n for n in zf.namelist() if n.lower().endswith(".xml")]
-            for name in xmls:
-                try:
-                    xml = zf.read(name).decode("utf-8", errors="ignore")
-                    txt = re.sub(r"<[^>]+>", " ", xml)
-                    texts.append(txt)
-                except Exception:
-                    continue
-        out = re.sub(r"\s{2,}", " ", "\n".join(texts)).strip()
-        return out if out else "[HWPX 추출 결과 비어있음]"
-    except Exception as e:
-        return f"[HWPX 추출 실패] {e}"
-
-
 def text_to_pdf_bytes_korean(text: str, title: str = ""):
     try:
         from reportlab.lib.pagesizes import A4
         from reportlab.lib.units import mm
         from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
         from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-        from reportlab.pdfbase import pdfmetrics
-        from reportlab.pdfbase.ttfonts import TTFont
         from reportlab.lib.enums import TA_LEFT
-        font_name = "NanumGothic"; font_path = "/usr/share/fonts/truetype/nanum/NanumGothic.ttf"
-        if os.path.exists(font_path):
-            pdfmetrics.registerFont(TTFont(font_name, font_path))
-        else:
-            font_name = "Helvetica"
+        font_name = _resolve_pdf_font_name()
         styles = getSampleStyleSheet()
         base = ParagraphStyle(name="KBase", parent=styles["Normal"], fontName=font_name, fontSize=10.5, leading=14.5, alignment=TA_LEFT)
         h2 = ParagraphStyle(name="KH2", parent=base, fontSize=15, leading=19)
@@ -408,40 +392,43 @@ def text_to_pdf_bytes_korean(text: str, title: str = ""):
 
 # =============================
 # any → PDF 변환 (요청 사양)
-#   1차: HWP/HWPX는 로컬(pyhwp/hwp5txt)로 텍스트 추출 → 간이PDF
+#   1차: HWP/HWPX는 순수 파서로 텍스트 추출 → 간이PDF
 #   2차: 그 외/실패 시 CloudConvert API
 # =============================
 ALLOWED_UPLOAD_EXTS = {".pdf",".hwp",".hwpx",".doc",".docx",".ppt",".pptx",".xls",".xlsx",".txt",".csv",".md",".log"}
 
-def convert_any_to_pdf(file_bytes: bytes, filename: str) -> tuple[bytes | None, str]:
+def convert_any_to_pdf(file_bytes: bytes, filename: str) -> tuple[bytes | None, str, str | None]:
     ext = (os.path.splitext(filename)[1] or "").lower()
 
-    # 1) HWP (로컬)
+    # 1) HWP (로컬 파서)
     if ext == ".hwp":
-        t, dbg = convert_hwp_with_pyhwp(file_bytes)
-        if t:
-            pdf, dbg2 = text_to_pdf_bytes_korean(t, title=os.path.basename(filename))
+        text_local, dbg_local = convert_hwp_local_to_text(file_bytes)
+        if text_local:
+            pdf, dbg_pdf = text_to_pdf_bytes_korean(text_local, title=os.path.basename(filename))
             if pdf:
-                return pdf, f"{dbg} → {dbg2}"
-        # 2) CloudConvert
-        return cloudconvert_convert_to_pdf(file_bytes, filename)
+                return pdf, f"{dbg_local} → {dbg_pdf}", text_local
+        # 로컬 추출 실패 시 CloudConvert 1회 시도
+        pdf, status = cloudconvert_convert_to_pdf(file_bytes, filename)
+        return pdf, status, None
 
     # 1) HWPX (로컬 텍스트)
     if ext == ".hwpx":
-        t = extract_text_from_hwpx_bytes(file_bytes)
-        if t and not t.startswith("[HWPX 추출 실패]"):
-            pdf, dbg2 = text_to_pdf_bytes_korean(t, title=os.path.basename(filename))
+        text_hwpx, dbg_hwpx = extract_text_from_hwpx_bytes(file_bytes)
+        if text_hwpx:
+            pdf, dbg2 = text_to_pdf_bytes_korean(text_hwpx, title=os.path.basename(filename))
             if pdf:
-                return pdf, dbg2
+                return pdf, f"{dbg_hwpx} → {dbg2}", text_hwpx
         # 2) CloudConvert
-        return cloudconvert_convert_to_pdf(file_bytes, filename)
+        pdf, status = cloudconvert_convert_to_pdf(file_bytes, filename)
+        return pdf, status, None
 
     # PDF는 그대로
     if ext == ".pdf":
-        return file_bytes, "이미 PDF"
+        return file_bytes, "이미 PDF", None
 
     # 나머지 형식은 CloudConvert 1회 시도
-    return cloudconvert_convert_to_pdf(file_bytes, filename)
+    pdf, status = cloudconvert_convert_to_pdf(file_bytes, filename)
+    return pdf, status, None
 
 # =============================
 # 첨부 링크 매트릭스 (Compact 카드 UI)
@@ -684,7 +671,14 @@ from datetime import datetime
 import pandas as pd
 import numpy as np
 import streamlit as st
-import plotly.express as px
+
+if 'px' not in globals() or px is None:  # 상단 병합형 스크립트 호환성 유지
+    try:
+        import plotly.express as px
+        _PLOTLY_IMPORT_ERROR = ""
+    except ImportError as _plotly_exc:
+        px = None
+        _PLOTLY_IMPORT_ERROR = str(_plotly_exc)
 
 # =============================
 # 업로드/데이터 로드
@@ -792,6 +786,13 @@ def markdown_to_pdf_korean(md_text: str, title: str | None = None):
 from math import isfinite
 
 def render_basic_analysis_charts(base_df: pd.DataFrame):
+    if px is None:
+        warn_msg = "Plotly 미설치로 차트 기능이 비활성화되었습니다. requirements.txt를 설치해주세요."
+        if _PLOTLY_IMPORT_ERROR:
+            warn_msg += f" (원인: {_PLOTLY_IMPORT_ERROR})"
+        st.warning(warn_msg)
+        return
+
     def pick_unit(max_val: float):
         if max_val >= 1_0000_0000_0000:
             return ("조원", 1_0000_0000_0000)
@@ -979,8 +980,7 @@ def render_basic_analysis_charts(base_df: pd.DataFrame):
             grp = grp.sort_values(["연", "분", group_col]).reset_index(drop=True)
             ordered_quarters = grp.sort_values(["연", "분"])["연도분기"].unique()
             grp["연도분기"] = pd.Categorical(grp["연도분기"], categories=ordered_quarters, ordered=True)
-            import numpy as _np
-            custom = _np.column_stack([grp[group_col].astype(str).to_numpy(), grp["입찰공고목록"].astype(str).to_numpy()])
+            custom = np.column_stack([grp[group_col].astype(str).to_numpy(), grp["입찰공고목록"].astype(str).to_numpy()])
             fig_stack = px.bar(
                 grp,
                 x="연도분기",
@@ -1000,7 +1000,11 @@ def render_basic_analysis_charts(base_df: pd.DataFrame):
                     "입찰공고명: %{{customdata[1]}}"
                 ),
             )
-            fig_stack.update_layout(xaxis_title="연도분기", yaxis_title="배정예산금액 (원)", margin=dict(l=10, r=10, t=60, b=10))
+            fig_stack.update_layout(
+                xaxis_title="연도분기",
+                yaxis_title="배정예산금액 (원)",
+                margin=dict(l=10, r=10, t=60, b=10),
+            )
             st.plotly_chart(fig_stack, use_container_width=True)
         else:
             st.info("그룹핑 결과가 비어 있습니다.")
@@ -1015,11 +1019,9 @@ def render_basic_analysis_charts(base_df: pd.DataFrame):
                 .apply(lambda s: " | ".join(pd.Series(s).dropna().astype(str).unique()[:10]))
                 .reindex(grp_total["연도분기"]).fillna("")
             )
-            import numpy as _np
-            custom2 = _np.stack([titles_total], axis=-1)
+            custom2 = np.array(titles_total.astype(str).to_list()).reshape(-1, 1)
         else:
-            import numpy as _np
-            custom2 = _np.stack([pd.Series([""])], axis=-1)
+            custom2 = np.array(["" for _ in range(len(grp_total))]).reshape(-1, 1)
         fig_bar = px.bar(grp_total, x="연도분기", y="금액합", title="연·분기별 배정예산금액 (총합)", text="금액합")
         fig_bar.update_traces(
             customdata=custom2,
@@ -1190,12 +1192,30 @@ elif menu_val == "내고객 분석하기":
                                         data = f.read()
                                         ext = (os.path.splitext(name)[1] or "").lower()
                                         if ext in [".pdf", ".hwp", ".hwpx", ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx"]:
-                                            pdf_bytes, dbg = convert_any_to_pdf(data, name)
+                                            pdf_bytes, dbg, plain_text = convert_any_to_pdf(data, name)
+                                            safe_label = os.path.splitext(name)[0] + ".pdf"
+                                            if plain_text:
+                                                stats = collect_text_statistics(plain_text, QUALITY_KEYWORDS)
+                                                keyword_state = f"{len(stats['found_keywords'])}/{len(QUALITY_KEYWORDS)} 키워드"
+                                                if stats["missing_keywords"]:
+                                                    keyword_state += f" (누락: {', '.join(stats['missing_keywords'])})"
+                                                redact = _redact_secrets(plain_text)
+                                                convert_logs.append(
+                                                    f"📝 {name}: 로컬 텍스트 추출 성공 ({len(redact)} chars, {keyword_state})"
+                                                )
+                                                combined_texts.append(
+                                                    f"\n\n===== [{name} → TEXT] =====\n{redact}\n"
+                                                )
                                             if pdf_bytes:
-                                                generated_pdfs.append((os.path.splitext(name)[0] + ".pdf", pdf_bytes))
+                                                generated_pdfs.append((safe_label, pdf_bytes))
                                                 txt = extract_text_from_pdf_bytes(pdf_bytes)
-                                                convert_logs.append(f"✅ {name} → PDF 변환 성공 ({dbg}), 텍스트 {len(txt)} chars")
-                                                combined_texts.append(f"\n\n===== [{name} → PDF] =====\n{_redact_secrets(txt)}\n")
+                                                convert_logs.append(
+                                                    f"✅ {name} → PDF 변환 성공 ({dbg}), 텍스트 {len(txt)} chars"
+                                                )
+                                                if txt.strip():
+                                                    combined_texts.append(
+                                                        f"\n\n===== [{name} → PDF] =====\n{_redact_secrets(txt)}\n"
+                                                    )
                                             else:
                                                 convert_logs.append(f"🛑 {name}: PDF 변환 실패 ({dbg})")
                                         elif ext in [".txt", ".csv", ".md", ".log"]:
