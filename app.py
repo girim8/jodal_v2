@@ -28,7 +28,12 @@ from datetime import datetime
 import streamlit as st
 import pandas as pd
 import numpy as np
-import plotly.express as px
+PLOTLY_IMPORT_ERROR = None
+try:  # Plotly는 선택적으로 설치되어 있을 수 있으므로 안전하게 로드한다.
+    import plotly.express as px
+except ModuleNotFoundError as plotly_exc:  # pragma: no cover - Streamlit 환경 의존
+    px = None  # type: ignore[assignment]
+    PLOTLY_IMPORT_ERROR = str(plotly_exc)
 
 from hwp_utils import convert_hwp_local_to_text
 
@@ -61,6 +66,21 @@ for k, v in {
 
 SERVICE_DEFAULT = ["전용회선", "전화", "인터넷"]
 HTML_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _ensure_plotly_available() -> bool:
+    """Plotly 미설치 시 사용자가 즉시 인지할 수 있도록 안내한다."""
+
+    if px is not None:
+        return True
+    error_detail = f" (원인: {PLOTLY_IMPORT_ERROR})" if PLOTLY_IMPORT_ERROR else ""
+    st.error(
+        "Plotly가 설치되지 않아 대시보드 차트를 그릴 수 없습니다." + error_detail
+    )
+    st.info(
+        "requirements.txt에 `plotly==5.24.1`를 유지하고 `pip install plotly` 이후 다시 실행해 주세요."
+    )
+    return False
 
 # =============================
 # 민감정보 마스킹
@@ -694,7 +714,12 @@ from datetime import datetime
 import pandas as pd
 import numpy as np
 import streamlit as st
-import plotly.express as px
+
+if "px" not in globals():
+    try:  # 1/2 파일을 단독 실행할 경우를 대비한 보강
+        import plotly.express as px
+    except ModuleNotFoundError:  # pragma: no cover - Streamlit 환경 의존
+        px = None  # type: ignore[assignment]
 
 # =============================
 # 업로드/데이터 로드
@@ -802,6 +827,9 @@ def markdown_to_pdf_korean(md_text: str, title: str | None = None):
 from math import isfinite
 
 def render_basic_analysis_charts(base_df: pd.DataFrame):
+    if not _ensure_plotly_available():
+        return
+
     def pick_unit(max_val: float):
         if max_val >= 1_0000_0000_0000:
             return ("조원", 1_0000_0000_0000)
