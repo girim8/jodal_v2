@@ -7,3 +7,6 @@ dependencies = [
     "olefile>=0.47",
     "streamlit>=1.51.0",
 ]
+
+[tool.poetry]
+package-mode = false
