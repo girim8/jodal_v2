@@ -1,7 +1,0 @@
-python3-uno
-fonts-noto-cjk
-libreoffice
-unoconv
-poppler-utils
-fonts-nanum
-imagemagick
