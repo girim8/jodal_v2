@@ -1,149 +1,137 @@
-#!/usr/bin/env python3
-"""
-HWP Record-based parser for proper text extraction
-"""
+"""HWP/HWPX 파일에서 텍스트를 뽑아내는 도우미 함수 모음."""
 
+from __future__ import annotations
+
+import io
 import struct
+import zipfile
 import zlib
+
 import olefile
+from xml.etree import ElementTree
 
-class HWPRecordParser:
-    """Parse HWP file records to extract text"""
-    
-    def __init__(self, ole_file):
-        self.ole = ole_file
-        
-    def read_record_header(self, data, offset):
-        """Read HWP record header (4 bytes)"""
-        if offset + 4 > len(data):
-            return None, None, offset
-        
-        header = struct.unpack('<I', data[offset:offset+4])[0]
-        
-        # Extract record type and size from header
-        record_id = header & 0x3FF  # Lower 10 bits
-        level = (header >> 10) & 0x3FF  # Next 10 bits
-        size = (header >> 20) & 0xFFF  # Upper 12 bits
-        
-        return record_id, size, offset + 4
-    
-    def decompress_record(self, data):
-        """Decompress record data if compressed"""
+
+def _maybe_decompress(data: bytes) -> bytes:
+    """BodyText 스트림에서 자주 쓰이는 압축 방식을 순차적으로 해제한다."""
+    # RAW zlib → 표준 zlib → 무압축 순서로 시도한다.
+    for mode in (-zlib.MAX_WBITS, zlib.MAX_WBITS, None):
         try:
-            # Try zlib decompression
-            return zlib.decompress(data)
-        except:
-            return data
-    
-    def extract_text_from_bodytext(self, stream_name='BodyText/Section0'):
-        """Extract text from BodyText section"""
-        try:
-            data = self.ole.openstream(stream_name).read()
-        except:
-            return ""
-        
-        extracted_texts = []
-        offset = 0
-        
-        print(f"Parsing {stream_name} ({len(data):,} bytes)...")
-        
-        while offset < len(data):
-            record_id, size, new_offset = self.read_record_header(data, offset)
-            
-            if record_id is None:
-                break
-            
-            # Read record data
-            if new_offset + size > len(data):
-                break
-            
-            record_data = data[new_offset:new_offset + size]
-            
-            # HWP record types that contain text:
-            # 0x50 (HWPTAG_PARA_TEXT) - Paragraph text
-            # 0x43 (HWPTAG_PARA_CHAR_SHAPE) - Character formatting
-            # 0x45 (HWPTAG_TABLE) - Table data
-            
-            if record_id == 0x50:  # PARA_TEXT
-                # Try to decompress if needed
-                try_decompress = self.decompress_record(record_data)
-                
-                # Try different encodings
-                for encoding in ['utf-16le', 'utf-8', 'cp949', 'euc-kr']:
-                    try:
-                        text = try_decompress.decode(encoding, errors='ignore')
-                        # Check if we got meaningful Korean text
-                        if any('\uac00' <= c <= '\ud7a3' for c in text):
-                            extracted_texts.append(text)
-                            break
-                    except:
-                        continue
-            
-            offset = new_offset + size
-        
-        return '\n'.join(extracted_texts)
-    
-    def extract_all_text(self):
-        """Extract text from all available streams"""
-        all_text = []
-        
-        # Get all BodyText sections
-        for stream_path in self.ole.listdir():
-            stream_name = '/'.join(stream_path)
-            
-            if 'BodyText/' in stream_name:
-                text = self.extract_text_from_bodytext(stream_name)
-                if text:
-                    all_text.append(text)
-        
-        return '\n'.join(all_text)
+            if mode is None:
+                return data
+            return zlib.decompress(data, mode)
+        except zlib.error:
+            continue
+    return data
 
 
-def test_hwp_parser():
-    """Test the HWP parser"""
-    test_file = 'attached_assets/20210430609-00_1618895289680_4단계 스쿨넷 사업 제안요청서(조달청 추가 의견 반영본) - 복사본_1762740838248.hwp'
-    
-    KEYWORDS = ['스쿨넷', '추정금액', '이중화', 'Aggregation']
-    
-    print("="*80)
-    print("Testing HWP Record Parser")
-    print("="*80)
-    
-    with open(test_file, 'rb') as f:
-        hwp_data = f.read()
-    
-    ole = olefile.OleFileIO(hwp_data)
-    parser = HWPRecordParser(ole)
-    
-    text = parser.extract_all_text()
-    
-    print(f"\nExtracted {len(text):,} characters")
-    
-    korean_count = sum(1 for c in text if '\uac00' <= c <= '\ud7a3')
-    print(f"Korean characters: {korean_count:,}")
-    
-    print("\nKeyword검색:")
-    found = []
-    for keyword in KEYWORDS:
-        if keyword in text:
-            print(f"  ✓ {keyword}")
-            found.append(keyword)
-        else:
-            print(f"  ✗ {keyword}")
-    
-    if len(found) == len(KEYWORDS):
-        print("\n✅ SUCCESS! All keywords found!")
+def _clean_text(text: str) -> str:
+    """인쇄 가능한 문자만 남기고 줄바꿈을 정리한다."""
+    filtered = "".join(ch for ch in text if ch.isprintable() or ch.isspace())
+    lines = [line.strip() for line in filtered.splitlines()]
+    return "\n".join(line for line in lines if line).strip()
+
+
+def _parse_body_records(data: bytes) -> str:
+    """BodyText 레코드를 순회하면서 사람이 읽을 수 있는 텍스트만 모은다."""
+    text_chunks: list[str] = []
+    offset = 0
+    length = len(data)
+
+    while offset + 4 <= length:
+        header = struct.unpack("<I", data[offset : offset + 4])[0]
+        tag_id = header & 0x3FF
+        size = (header >> 20) & 0xFFF
+        offset += 4
+
+        if offset + size > length:
+            break
+
+        payload = data[offset : offset + size]
+        offset += size
+
+        if tag_id in (66, 67, 68, 80):
+            # 본문에 해당하는 레코드만 압축 해제 후 디코딩한다.
+            payload = _maybe_decompress(payload)
+            try:
+                decoded = payload.decode("utf-16le", errors="ignore")
+            except UnicodeDecodeError:
+                continue
+
+            cleaned = _clean_text(decoded)
+            if cleaned:
+                text_chunks.append(cleaned)
+
+    return "\n".join(text_chunks)
+
+
+def extract_text_from_hwp(data: bytes) -> str:
+    """OLE 스트림을 직접 읽어 바이너리 HWP 문서에서 텍스트를 뽑는다."""
+    text_parts: list[str] = []
+
+    with olefile.OleFileIO(io.BytesIO(data)) as ole:
+        for entry in ole.listdir():
+            if not entry or entry[0] != "BodyText":
+                continue
+
+            stream_name = "/".join(entry)
+            try:
+                raw_stream = ole.openstream(entry).read()
+            except OSError:
+                continue
+
+            # BodyText 스트림은 또 한 번 압축돼 있을 수 있다.
+            parsed = _parse_body_records(_maybe_decompress(raw_stream))
+            if parsed:
+                text_parts.append(f"[{stream_name}]\n{parsed}")
+
+    return _clean_text("\n\n".join(text_parts))
+
+
+def extract_text_from_hwpx(data: bytes) -> str:
+    """ZIP 안의 XML 파일들을 합쳐 HWPX 문서의 텍스트를 만든다."""
+    text_chunks: list[str] = []
+
+    with zipfile.ZipFile(io.BytesIO(data)) as archive:
+        for name in archive.namelist():
+            if not name.endswith(".xml"):
+                continue
+
+            try:
+                xml_data = archive.read(name)
+            except KeyError:
+                continue
+
+            try:
+                root = ElementTree.fromstring(xml_data)
+            except ElementTree.ParseError:
+                continue
+
+            # itertext()로 태그 사이의 문자만 빠르게 추출한다.
+            text_chunks.append("".join(root.itertext()))
+
+    return _clean_text("\n".join(text_chunks))
+
+
+def convert_to_text(data: bytes, filename: str | None = None) -> tuple[str, str]:
+    """파일 포맷을 판별하고 텍스트와 판별 결과를 함께 돌려준다."""
+    name = (filename or "").lower()
+    is_hwpx = name.endswith("hwpx") or data[:2] == b"PK"
+
+    if is_hwpx:
+        text = extract_text_from_hwpx(data)
+        fmt = "HWPX"
     else:
-        print(f"\n⚠️ Found {len(found)}/{len(KEYWORDS)} keywords")
-    
-    print(f"\nSample text (first 500 chars):")
-    print("-" * 80)
-    print(text[:500])
-    
-    ole.close()
-    
-    return text, found
+        text = extract_text_from_hwp(data)
+        fmt = "HWP"
+
+    if not text:
+        raise ValueError("Unable to extract text from the provided file.")
+
+    return text, fmt
 
 
-if __name__ == '__main__':
-    test_hwp_parser()
+__all__ = [
+    "convert_to_text",
+    "extract_text_from_hwp",
+    "extract_text_from_hwpx",
+]
