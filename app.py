@@ -35,7 +35,8 @@ st.success(f"Done! Detected {fmt} document and extracted its text.")
 st.text_area("Extracted text", text, height=400)
 st.download_button(
     label="Download TXT",
-    data=text.encode("utf-8"),
+    # Windows 기본 메모장에서도 한글이 깨지지 않도록 BOM이 포함된 UTF-8로 저장한다.
+    data=text.encode("utf-8-sig"),
     file_name=uploaded_file.name.rsplit(".", 1)[0] + ".txt",
     mime="text/plain",
 )
