@@ -4,10 +4,15 @@
 # - 로그인(팝업 없음) + 관리자 백도어(emp=2855, dob=910518)
 # - 업로드 엑셀(filtered 시트) 로드/필터/차트/다운로드
 # - 첨부 링크 매트릭스 + Compact 카드 UI
-# - LLM 분석 2단계(업그레이드):
-#   0) 모든 파일형식에 대해 Gemini가 '파일 그대로' 선 처리 시도
-#   1) Gemini가 실패하면 로컬 추출(pdf/text) 혹은 CloudConvert → PDF → 텍스트
-# - HWP/HWPX 로컬 변환/any→pdf/hwp5txt 삭제 완료
+# - LLM 분석:
+#   0) 모든 파일 형식에 대해 Gemini가 파일 그대로 선 처리 시도
+#   1) 실패 시 텍스트류/ PDF는 로컬 추출
+#   2) 그 외(hwp/hwpx/docx/pptx/xlsx 등) → CloudConvert PDF → 로컬 텍스트
+# - ✅ 신규 전처리:
+#   * 엑셀 로드 직후 filtered 시트에 '서비스구분' 컬럼 생성/분류 후 맨 뒤 추가
+#   * **입찰공고명**만 보고 분류 (다른 컬럼 무시)
+#   * 사이드바 '서비스구분' 다중선택 필터 생성
+#   * default 선택값은 '전용회선','전화','인터넷'만
 
 import os
 import re
@@ -444,6 +449,71 @@ def markdown_to_pdf_korean(md_text: str, title: str | None = None):
     return text_to_pdf_bytes_korean(md_text, title or "")
 
 # =============================
+# ✅ 서비스구분 컬럼 생성 (입찰공고명만 사용)
+# =============================
+classification_rules = {
+    '통신': '전용회선', '회선': '전용회선', '전송': '전용회선', '망': '전용회선',
+    '인터넷': '인터넷', '콜': '전화', '문자': 'SMS', '고객센터': '전화',
+    'C그룹': '전화', '전용회선': '전용회선', '단말기': 'NSI',
+    '스마트기기': 'NSI', '스마트 기기': 'NSI', 'LTE': '무선', '5G': '무선', '무선': '무선',
+    '대표번호': '전화', 'IDC': 'IDC', 'CDN': 'IDC', '스쿨넷': '전용회선',
+    '클라우드': 'IDC', '와이파이': '인터넷', '백업': 'IDC', 'IoT': '무선',
+    '메시지': '문자', '메세지': '문자', 'Contact': '전화', 'cloud': 'IDC',
+    '디도스': '보안', '보안': '보안', '관제': '보안', '재난': '보안',
+    '유지보수': '유지보수',
+    '안심알리미': 'NSI',
+    '안심 알리미': 'NSI',
+    '전기공사': '유지보수',
+    '스토리지': 'NSI',
+    '음식물': 'NSI',
+    '소액': 'NSI',
+    '통화': '전화',
+    '위협': '전화',
+    '전화기': '전화',
+    '모바일행정전화': '전화',
+    '휴대폰': '무선',
+    'LED': 'NSI',
+    '조명': 'NSI',
+    '태블릿': 'NSI',
+    '네트워크': '전용회선',
+    '스마트단말': 'NSI',
+    '운영대행': '유지보수',
+    '모바일': '무선',
+    'AI': 'AI',
+    '인공지능': 'AI',
+    '빅데이터': 'AI',
+    '구내전화': '전화', 'IPTV': '미디어', 'CCTV': 'CCTV'
+}
+
+def add_service_category(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    df 로드 직후 호출.
+    - '서비스구분'을 맨 뒤에 추가/재생성
+    - ✅ '입찰공고명' 컬럼만 보고 키워드 매칭 분류
+    """
+    if "서비스구분" in df.columns:
+        df = df.copy()
+        _ = df.pop("서비스구분")
+
+    df["서비스구분"] = "미분류"  # 맨 뒤에 생성
+
+    if "입찰공고명" not in df.columns:
+        return df
+
+    rule_items = list(classification_rules.items())
+
+    def classify_title(title: str) -> str:
+        t = "" if pd.isna(title) else str(title)
+        tl = t.lower()
+        for k, label in rule_items:
+            if (k in t) or (k.lower() in tl):
+                return label
+        return "미분류"
+
+    df["서비스구분"] = df["입찰공고명"].apply(classify_title)
+    return df
+
+# =============================
 # 첨부 링크 매트릭스 (Compact 카드 UI)
 # =============================
 CSS_COMPACT = """
@@ -631,7 +701,6 @@ def login_gate():
 def render_sidebar_base():
     st.sidebar.title("📂 데이터 업로드")
 
-    # ✅ 업로더 값을 즉시 받아 세션에 저장 (빈칸 표시/미반영 이슈 방지)
     up = st.sidebar.file_uploader(
         "filtered 시트가 포함된 병합 엑셀 업로드 (.xlsx)",
         type=["xlsx"],
@@ -642,7 +711,6 @@ def render_sidebar_base():
 
     st.sidebar.radio("# 📋 메뉴 선택", ["조달입찰결과현황", "내고객 분석하기"], key="menu")
 
-    # Gemini 키
     with st.sidebar.expander("🔑 Gemini API Key", expanded=True):
         if _get_gemini_key_from_secrets():
             st.success("st.secrets에서 Gemini 키를 불러왔습니다. (권장)")
@@ -674,15 +742,13 @@ def render_sidebar_base():
                          key="gpt_extra_req")
 
 def render_sidebar_filters(df: pd.DataFrame):
-    # 업로드 후에만 보이는 필터 영역
     st.sidebar.markdown("---")
     st.sidebar.subheader("🧰 필터")
 
-    # 서비스구분
+    # ✅ 서비스구분 다중선택 (default는 전용회선/전화/인터넷만)
     if "서비스구분" in df.columns:
         options = sorted([str(x) for x in df["서비스구분"].dropna().unique()])
-        defaults = [x for x in st.session_state.get("svc_filter_seed", SERVICE_DEFAULT) if x in options] or \
-                   [x for x in SERVICE_DEFAULT if x in options] or options[:3]
+        defaults = [x for x in SERVICE_DEFAULT if x in options]  # fallback 없음
         st.sidebar.multiselect(
             "서비스구분 선택",
             options=options,
@@ -723,7 +789,7 @@ if not st.session_state.get("authed", False):
 render_sidebar_base()
 
 # =============================
-# 업로드/데이터 로드 (업로드가 없으면 메인만 안내)
+# 업로드/데이터 로드
 # =============================
 uploaded_file = st.session_state.get("uploaded_file_obj")
 if not uploaded_file:
@@ -736,6 +802,9 @@ try:
 except Exception as e:
     st.error(f"엑셀 로드 실패: {e}")
     st.stop()
+
+# ✅ 로드 직후: 입찰공고명만 보고 서비스구분 생성
+df = add_service_category(df)
 
 df_original = df.copy()
 
@@ -1107,3 +1176,5 @@ elif menu_val == "내고객 분석하기":
 
                 for m in st.session_state.get("chat_messages", []):
                     st.chat_message("user" if m["role"] == "user" else "assistant").markdown(m["content"])
+
+# ========= EOF =========
