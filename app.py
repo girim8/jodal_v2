@@ -4,15 +4,16 @@
 # - 로그인(팝업 없음) + 관리자 백도어(emp=2855, dob=910518)
 # - 업로드 엑셀(filtered 시트) 로드/필터/차트/다운로드
 # - 첨부 링크 매트릭스 + Compact 카드 UI
-# - LLM 분석 2단계:
-#   1) Gemini 선 사용(텍스트 기반: pdf/txt/csv/md/log)
-#   2) 불가 파일은 CloudConvert → PDF → 텍스트
+# - LLM 분석 2단계(업그레이드):
+#   0) 모든 파일형식에 대해 Gemini가 '파일 그대로' 선 처리 시도
+#   1) Gemini가 실패하면 로컬 추출(pdf/text) 혹은 CloudConvert → PDF → 텍스트
 # - HWP/HWPX 로컬 변환/any→pdf/hwp5txt 삭제 완료
 
 import os
 import re
 import json
 import base64
+import mimetypes
 import requests
 from io import BytesIO
 from urllib.parse import urlparse, unquote
@@ -185,6 +186,102 @@ def call_gemini(messages, temperature=0.4, max_tokens=2000, model="gemini-2.0-fl
         raise Exception(f"Gemini 응답 파싱 실패: {e}")
 
     raise Exception("Gemini 응답이 비어있습니다.")
+
+# =============================
+# ✅ Gemini 파일(바이너리 포함) 직접 선추출 헬퍼
+# =============================
+def guess_mime_type(filename: str) -> str:
+    ext = (os.path.splitext(filename)[1] or "").lower()
+    manual = {
+        ".hwp": "application/x-hwp",
+        ".hwpx": "application/vnd.hancom.hwpx",
+        ".doc": "application/msword",
+        ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ".ppt": "application/vnd.ms-powerpoint",
+        ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        ".xls": "application/vnd.ms-excel",
+        ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        ".pdf": "application/pdf",
+        ".txt": "text/plain",
+        ".csv": "text/csv",
+        ".md": "text/markdown",
+        ".log": "text/plain",
+    }
+    if ext in manual:
+        return manual[ext]
+    mt, _ = mimetypes.guess_type(filename)
+    return mt or "application/octet-stream"
+
+
+def gemini_try_extract_text_from_file(
+    file_bytes: bytes,
+    filename: str,
+    temperature: float = 0.2,
+    max_tokens: int = 2048,
+    model: str = "gemini-2.0-flash",
+) -> str | None:
+    """
+    모든 파일 형식에 대해 Gemini에 '파일 그대로' 전달해서 텍스트 추출을 시도.
+    - 성공하면 텍스트 반환
+    - 실패하거나 의미있는 텍스트가 없으면 None 반환
+    """
+    key = _get_gemini_key()
+    if not key:
+        return None
+
+    mime_type = guess_mime_type(filename)
+
+    # 너무 큰 파일은 inline_data 실패 가능성이 높아 폴백으로 넘김(약 15MB)
+    if len(file_bytes) > 15 * 1024 * 1024:
+        return None
+
+    prompt = dedent(f"""
+    너는 파일에서 텍스트를 추출하는 도우미야.
+    다음 첨부 파일({filename})의 내용을 가능한 한 **원문 중심으로** 텍스트로 뽑아줘.
+    - 표는 텍스트/마크다운 형태로 최대한 보존해.
+    - 이미지/도면은 캡션 수준으로만 간단히 설명.
+    - 추출 불가하면 'EXTRACTION_FAILED'라고만 답해.
+    """).strip()
+
+    payload = {
+        "contents": [{
+            "role": "user",
+            "parts": [
+                {"text": prompt},
+                {
+                    "inline_data": {
+                        "mime_type": mime_type,
+                        "data": base64.b64encode(file_bytes).decode("ascii")
+                    }
+                }
+            ]
+        }],
+        "generationConfig": {
+            "temperature": float(temperature),
+            "maxOutputTokens": int(max_tokens),
+        }
+    }
+
+    url = f"{GEMINI_API_BASE}/{model}:generateContent"
+    headers = {"Content-Type": "application/json", "X-goog-api-key": key}
+
+    try:
+        r = requests.post(url, headers=headers, data=json.dumps(payload), timeout=60)
+        r.raise_for_status()
+        data = r.json()
+        candidates = data.get("candidates", [])
+        if not candidates:
+            return None
+        parts = candidates[0]["content"]["parts"]
+        text = "\n".join([p.get("text", "") for p in parts]).strip()
+        if (not text) or ("EXTRACTION_FAILED" in text):
+            return None
+        if len(text) < 30:
+            return None
+        return _redact_secrets(text)
+    except Exception:
+        return None
+
 
 # =============================
 # CloudConvert API (2차 변환 전용)
@@ -757,13 +854,13 @@ def render_basic_analysis_charts(base_df: pd.DataFrame):
         st.plotly_chart(fig2, use_container_width=True)
 
 # =============================
-# LLM 분석용 텍스트 추출 (2단계 단순화)
+# LLM 분석용 텍스트 추출 (Gemini 선시도 → 폴백)
 # =============================
 TEXT_EXTS = {".txt", ".csv", ".md", ".log"}
 DIRECT_PDF_EXTS = {".pdf"}
 BINARY_EXTS = {".hwp", ".hwpx", ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx"}
 
-def extract_text_combo_2step(uploaded_files):
+def extract_text_combo_gemini_first(uploaded_files):
     combined_texts, convert_logs, generated_pdfs = [], [], []
 
     for f in uploaded_files:
@@ -771,7 +868,16 @@ def extract_text_combo_2step(uploaded_files):
         data = f.read()
         ext = (os.path.splitext(name)[1] or "").lower()
 
-        # 1) 텍스트 파일: 바로 읽기
+        # 0) ✅ 모든 파일형식: Gemini가 파일 그대로 선추출 시도
+        gem_txt = gemini_try_extract_text_from_file(data, name)
+        if gem_txt:
+            convert_logs.append(f"🤖 {name}: Gemini 선 추출 성공 ({len(gem_txt)} chars)")
+            combined_texts.append(f"\n\n===== [{name} | Gemini 선추출] =====\n{gem_txt}\n")
+            continue
+        else:
+            convert_logs.append(f"🤖 {name}: Gemini 선 추출 실패 → 폴백 진행")
+
+        # 1) 텍스트 파일: 로컬 디코드
         if ext in TEXT_EXTS:
             for enc in ("utf-8-sig", "utf-8", "cp949", "euc-kr"):
                 try:
@@ -782,14 +888,14 @@ def extract_text_combo_2step(uploaded_files):
             else:
                 txt = data.decode("utf-8", errors="ignore")
 
-            convert_logs.append(f"🗒️ {name}: 텍스트 로드 완료")
+            convert_logs.append(f"🗒️ {name}: 로컬 텍스트 로드 완료")
             combined_texts.append(f"\n\n===== [{name}] =====\n{_redact_secrets(txt)}\n")
             continue
 
-        # 2) PDF: 텍스트 추출
+        # 2) PDF: 로컬 텍스트 추출
         if ext in DIRECT_PDF_EXTS:
             txt = extract_text_from_pdf_bytes(data)
-            convert_logs.append(f"✅ {name}: PDF 텍스트 추출 {len(txt)} chars")
+            convert_logs.append(f"✅ {name}: 로컬 PDF 텍스트 추출 {len(txt)} chars")
             combined_texts.append(f"\n\n===== [{name}] =====\n{_redact_secrets(txt)}\n")
             continue
 
@@ -808,7 +914,6 @@ def extract_text_combo_2step(uploaded_files):
         convert_logs.append(f"ℹ️ {name}: 미지원 형식(패스)")
 
     return "\n".join(combined_texts).strip(), convert_logs, generated_pdfs
-
 
 # =============================
 # 메뉴
@@ -881,9 +986,12 @@ elif menu_val == "내고객 분석하기":
 
                 # ===== Gemini 분석 =====
                 st.markdown("---")
-                st.subheader("🤖 Gemini 분석 (2단계 단순화)")
-                st.caption("1) Gemini 선 분석 가능한 파일(pdf/txt/csv/md/log) → 즉시 텍스트\n"
-                           "2) 나머지(hwp/hwpx/docx/pptx/xlsx 등) → CloudConvert PDF → 텍스트")
+                st.subheader("🤖 Gemini 분석 (Gemini 선시도 → 폴백)")
+                st.caption(
+                    "0) 모든 파일(Gemini가 파일 그대로 선 추출 시도)\n"
+                    "1) 실패시 텍스트류/ PDF는 로컬 추출\n"
+                    "2) 나머지(hwp/hwpx/docx/pptx/xlsx 등) → CloudConvert PDF → 로컬 텍스트"
+                )
 
                 src_files = st.file_uploader(
                     "분석할 파일 업로드 (여러 개 가능)",
@@ -897,7 +1005,7 @@ elif menu_val == "내고객 분석하기":
                         st.warning("먼저 분석할 파일을 업로드하세요.")
                     else:
                         with st.spinner("Gemini가 업로드된 자료로 보고서를 작성 중..."):
-                            combined_text, logs, generated_pdfs = extract_text_combo_2step(src_files)
+                            combined_text, logs, generated_pdfs = extract_text_combo_gemini_first(src_files)
 
                             st.write("### 변환/추출 로그")
                             for line in logs:
