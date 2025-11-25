@@ -1,18 +1,18 @@
 # -*- coding: utf-8 -*-
-# app.py — Streamlit Cloud 단일 파일 통합본 (Gemini + CloudConvert 2단계 단순화 버전)
+# app.py — Streamlit Cloud 단일 파일 통합본 (Gemini 선시도 + HWP 로컬추출 + CloudConvert 폴백)
 # - Secrets([[AUTH.users]], GEMINI_API_KEY, CLOUDCONVERT_API_KEY)
 # - 로그인(팝업 없음) + 관리자 백도어(emp=2855, dob=910518)
 # - 업로드 엑셀(filtered 시트) 로드/필터/차트/다운로드
 # - 첨부 링크 매트릭스 + Compact 카드 UI
-# - LLM 분석:
-#   0) 모든 파일 형식에 대해 Gemini가 파일 그대로 선 처리 시도
-#   1) 실패 시 텍스트류/ PDF는 로컬 추출
-#   2) 그 외(hwp/hwpx/docx/pptx/xlsx 등) → CloudConvert PDF → 로컬 텍스트
+# - LLM 분석 파이프라인:
+#   0) 모든 파일형식 Gemini에 파일 그대로 선처리 시도
+#   1) 실패 시 HWP/HWPX는 olefile/zip 로컬 TXT 추출(중간단계)
+#   2) 실패 시 텍스트류/ PDF는 로컬 추출
+#   3) 나머지 바이너리 → CloudConvert → PDF → 로컬 텍스트
 # - ✅ 신규 전처리:
 #   * 엑셀 로드 직후 filtered 시트에 '서비스구분' 컬럼 생성/분류 후 맨 뒤 추가
-#   * **입찰공고명**만 보고 분류 (다른 컬럼 무시)
-#   * 사이드바 '서비스구분' 다중선택 필터 생성
-#   * default 선택값은 '전용회선','전화','인터넷'만
+#   * **입찰공고명**만 보고 분류
+#   * 사이드바 '서비스구분' 다중선택 필터 (default: 전용회선/전화/인터넷)
 
 import os
 import re
@@ -24,12 +24,20 @@ from io import BytesIO
 from urllib.parse import urlparse, unquote
 from textwrap import dedent
 from datetime import datetime
-from typing import Tuple
 
 import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.express as px
+
+# ===== HWP/HWPX 로컬 추출용 =====
+import io
+import struct
+import zipfile
+import zlib
+from xml.etree import ElementTree
+import olefile
+
 
 # =============================
 # 전역/메타
@@ -62,6 +70,7 @@ for k, v in {
     if k not in st.session_state:
         st.session_state[k] = v
 
+
 # =============================
 # 민감정보 마스킹
 # =============================
@@ -76,6 +85,7 @@ def _redact_secrets(text: str) -> str:
         text,
     )
     return text
+
 
 # =============================
 # Secrets 헬퍼
@@ -94,6 +104,7 @@ def _get_auth_users_from_secrets() -> list:
         users = []
     return users
 
+
 def _get_gemini_key_from_secrets() -> str | None:
     try:
         key = st.secrets.get("GEMINI_API_KEY") if "GEMINI_API_KEY" in st.secrets else None
@@ -103,10 +114,12 @@ def _get_gemini_key_from_secrets() -> str | None:
         pass
     return None
 
+
 # =============================
 # Gemini API 래퍼
 # =============================
 GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
+
 
 def _get_gemini_key():
     key = (
@@ -115,6 +128,7 @@ def _get_gemini_key():
         or os.environ.get("GEMINI_API_KEY")
     )
     return key.strip() if key else None
+
 
 def _gemini_messages_to_contents(messages):
     sys_texts = [m["content"] for m in messages if m.get("role") == "system"]
@@ -142,6 +156,7 @@ def _gemini_messages_to_contents(messages):
     if not contents and sys_prefix:
         contents = [{"role": "user", "parts": [{"text": sys_prefix}]}]
     return contents
+
 
 def call_gemini(messages, temperature=0.4, max_tokens=2000, model="gemini-2.0-flash"):
     key = _get_gemini_key()
@@ -192,6 +207,7 @@ def call_gemini(messages, temperature=0.4, max_tokens=2000, model="gemini-2.0-fl
 
     raise Exception("Gemini 응답이 비어있습니다.")
 
+
 # =============================
 # ✅ Gemini 파일(바이너리 포함) 직접 선추출 헬퍼
 # =============================
@@ -225,11 +241,6 @@ def gemini_try_extract_text_from_file(
     max_tokens: int = 2048,
     model: str = "gemini-2.0-flash",
 ) -> str | None:
-    """
-    모든 파일 형식에 대해 Gemini에 '파일 그대로' 전달해서 텍스트 추출을 시도.
-    - 성공하면 텍스트 반환
-    - 실패하거나 의미있는 텍스트가 없으면 None 반환
-    """
     key = _get_gemini_key()
     if not key:
         return None
@@ -289,9 +300,122 @@ def gemini_try_extract_text_from_file(
 
 
 # =============================
-# CloudConvert API (2차 변환 전용)
+# ✅ HWP/HWPX 로컬 텍스트 추출 (olefile/zip)
+# =============================
+def _maybe_decompress(data: bytes) -> bytes:
+    for mode in (-zlib.MAX_WBITS, zlib.MAX_WBITS, None):
+        try:
+            if mode is None:
+                return data
+            return zlib.decompress(data, mode)
+        except zlib.error:
+            continue
+    return data
+
+
+def _clean_text(text: str) -> str:
+    filtered = "".join(ch for ch in text if ch.isprintable() or ch.isspace())
+    lines = [line.strip() for line in filtered.splitlines()]
+    return "\n".join(line for line in lines if line).strip()
+
+
+def _parse_body_records(data: bytes) -> str:
+    text_chunks: list[str] = []
+    offset = 0
+    length = len(data)
+
+    while offset + 4 <= length:
+        header = struct.unpack("<I", data[offset: offset + 4])[0]
+        tag_id = header & 0x3FF
+        size = (header >> 20) & 0xFFF
+        offset += 4
+
+        if offset + size > length:
+            break
+
+        payload = data[offset: offset + size]
+        offset += size
+
+        if tag_id in (66, 67, 68, 80):
+            payload = _maybe_decompress(payload)
+            try:
+                decoded = payload.decode("utf-16le", errors="ignore")
+            except UnicodeDecodeError:
+                continue
+
+            cleaned = _clean_text(decoded)
+            if cleaned:
+                text_chunks.append(cleaned)
+
+    return "\n".join(text_chunks)
+
+
+def extract_text_from_hwp(data: bytes) -> str:
+    text_parts: list[str] = []
+
+    with olefile.OleFileIO(io.BytesIO(data)) as ole:
+        for entry in ole.listdir():
+            if not entry or entry[0] != "BodyText":
+                continue
+
+            try:
+                raw_stream = ole.openstream(entry).read()
+            except OSError:
+                continue
+
+            parsed = _parse_body_records(_maybe_decompress(raw_stream))
+            if parsed:
+                stream_name = "/".join(entry)
+                text_parts.append(f"[{stream_name}]\n{parsed}")
+
+    return _clean_text("\n\n".join(text_parts))
+
+
+def extract_text_from_hwpx(data: bytes) -> str:
+    text_chunks: list[str] = []
+
+    with zipfile.ZipFile(io.BytesIO(data)) as archive:
+        for name in archive.namelist():
+            if not name.endswith(".xml"):
+                continue
+
+            try:
+                xml_data = archive.read(name)
+            except KeyError:
+                continue
+
+            try:
+                root = ElementTree.fromstring(xml_data)
+            except ElementTree.ParseError:
+                continue
+
+            text_chunks.append("".join(root.itertext()))
+
+    return _clean_text("\n".join(text_chunks))
+
+
+def convert_to_text(data: bytes, filename: str | None = None) -> tuple[str, str]:
+    name = (filename or "").lower()
+    is_hwpx = name.endswith("hwpx") or data[:2] == b"PK"
+
+    if is_hwpx:
+        text = extract_text_from_hwpx(data)
+        fmt = "HWPX"
+    else:
+        text = extract_text_from_hwp(data)
+        fmt = "HWP"
+
+    if not text:
+        raise ValueError("Unable to extract text from the provided file.")
+
+    return text, fmt
+
+
+# =============================
+# CloudConvert API (폴백 최후단)
 # =============================
 CLOUDCONVERT_API_BASE = "https://api.cloudconvert.com/v2"
+
 
 def _get_cloudconvert_key() -> str | None:
     try:
@@ -300,9 +424,11 @@ def _get_cloudconvert_key() -> str | None:
         key = None
     return key or os.environ.get("CLOUDCONVERT_API_KEY")
 
+
 @st.cache_data(show_spinner=False)
 def _cloudconvert_supported() -> bool:
     return _get_cloudconvert_key() is not None
+
 
 def cloudconvert_convert_to_pdf(file_bytes: bytes, filename: str, timeout_sec: int = 180) -> tuple[bytes | None, str]:
     api_key = _get_cloudconvert_key()
@@ -373,6 +499,7 @@ def cloudconvert_convert_to_pdf(file_bytes: bytes, filename: str, timeout_sec: i
     except Exception as e:
         return None, f"CloudConvert 다운로드 실패: {e}"
 
+
 # =============================
 # PDF 텍스트 추출 / Markdown→PDF(보고서용)
 # =============================
@@ -380,6 +507,7 @@ try:
     from PyPDF2 import PdfReader
 except Exception:
     PdfReader = None  # type: ignore
+
 
 def extract_text_from_pdf_bytes(file_bytes: bytes) -> str:
     try:
@@ -389,6 +517,7 @@ def extract_text_from_pdf_bytes(file_bytes: bytes) -> str:
         return "\n".join([(p.extract_text() or "") for p in reader.pages]).strip()
     except Exception as e:
         return f"[PDF 추출 실패] {e}"
+
 
 def text_to_pdf_bytes_korean(text: str, title: str = ""):
     try:
@@ -445,8 +574,10 @@ def text_to_pdf_bytes_korean(text: str, title: str = ""):
     except Exception as e:
         return None, f"PDF 생성 실패: {e}"
 
+
 def markdown_to_pdf_korean(md_text: str, title: str | None = None):
     return text_to_pdf_bytes_korean(md_text, title or "")
+
 
 # =============================
 # ✅ 서비스구분 컬럼 생성 (입찰공고명만 사용)
@@ -485,12 +616,8 @@ classification_rules = {
     '구내전화': '전화', 'IPTV': '미디어', 'CCTV': 'CCTV'
 }
 
+
 def add_service_category(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    df 로드 직후 호출.
-    - '서비스구분'을 맨 뒤에 추가/재생성
-    - ✅ '입찰공고명' 컬럼만 보고 키워드 매칭 분류
-    """
     if "서비스구분" in df.columns:
         df = df.copy()
         _ = df.pop("서비스구분")
@@ -500,7 +627,8 @@ def add_service_category(df: pd.DataFrame) -> pd.DataFrame:
     if "입찰공고명" not in df.columns:
         return df
 
-    rule_items = list(classification_rules.items())
+    # ✅ 긴 키워드 우선 매칭(충돌 최소화)
+    rule_items = sorted(classification_rules.items(), key=lambda x: len(x[0]), reverse=True)
 
     def classify_title(title: str) -> str:
         t = "" if pd.isna(title) else str(title)
@@ -512,6 +640,7 @@ def add_service_category(df: pd.DataFrame) -> pd.DataFrame:
 
     df["서비스구분"] = df["입찰공고명"].apply(classify_title)
     return df
+
 
 # =============================
 # 첨부 링크 매트릭스 (Compact 카드 UI)
@@ -534,9 +663,11 @@ CSS_COMPACT = """
 </style>
 """
 
+
 def _is_url(val: str) -> bool:
     s = str(val).strip()
     return s.startswith("http://") or s.startswith("https://")
+
 
 def _filename_from_url(url: str) -> str:
     try:
@@ -546,6 +677,7 @@ def _filename_from_url(url: str) -> str:
         return unquote(path.split("/")[-1]) or url
     except Exception:
         return url
+
 
 def build_attachment_matrix(df_like: pd.DataFrame, title_col: str) -> pd.DataFrame:
     if title_col not in df_like.columns:
@@ -615,6 +747,7 @@ def build_attachment_matrix(df_like: pd.DataFrame, title_col: str) -> pd.DataFra
         )
     return pd.DataFrame(rows).sort_values(by=[title_col]).reset_index(drop=True)
 
+
 def render_attachment_cards_html(df_links: pd.DataFrame, title_col: str) -> str:
     cat_cols = ["본공고링크", "제안요청서", "공고서", "과업지시서", "규격서", "기타"]
     present_cols = [c for c in cat_cols if c in df_links.columns]
@@ -646,6 +779,7 @@ def render_attachment_cards_html(df_links: pd.DataFrame, title_col: str) -> str:
     html.append('</div>')
     return "\n".join(html)
 
+
 # =============================
 # 벤더 정규화/색상
 # =============================
@@ -656,6 +790,7 @@ VENDOR_COLOR_MAP = {
     "에스케이텔레콤": "#1E90FF",
 }
 OTHER_SEQ = ["#2E8B57", "#6B8E23", "#556B2F", "#8B4513", "#A0522D", "#CD853F", "#228B22", "#006400"]
+
 
 def normalize_vendor(name: str) -> str:
     s = str(name) if pd.notna(name) else ""
@@ -669,10 +804,12 @@ def normalize_vendor(name: str) -> str:
         return "에스케이텔레콤"
     return s or "기타"
 
+
 # =============================
 # 로그인 게이트 & 사이드바
 # =============================
 INFO_BOX = "사번/생년월일은 사내 배포용으로만 사용됩니다."
+
 
 def login_gate():
     st.title("🔐 로그인")
@@ -697,6 +834,7 @@ def login_gate():
                 st.error("인증 실패. 사번/생년월일을 확인하세요.")
     with col2:
         st.info(INFO_BOX)
+
 
 def render_sidebar_base():
     st.sidebar.title("📂 데이터 업로드")
@@ -741,14 +879,15 @@ def render_sidebar_base():
                          placeholder="예) 'MACsec, SRv6 강조', '세부 일정 표 추가' 등",
                          key="gpt_extra_req")
 
+
 def render_sidebar_filters(df: pd.DataFrame):
     st.sidebar.markdown("---")
     st.sidebar.subheader("🧰 필터")
 
-    # ✅ 서비스구분 다중선택 (default는 전용회선/전화/인터넷만)
+    # ✅ 서비스구분 다중선택 (default: 전용회선/전화/인터넷)
     if "서비스구분" in df.columns:
         options = sorted([str(x) for x in df["서비스구분"].dropna().unique()])
-        defaults = [x for x in SERVICE_DEFAULT if x in options]  # fallback 없음
+        defaults = [x for x in SERVICE_DEFAULT if x in options]
         st.sidebar.multiselect(
             "서비스구분 선택",
             options=options,
@@ -780,6 +919,7 @@ def render_sidebar_filters(df: pd.DataFrame):
 
     df["_tmp_month"] = df["_tmp_date"].dt.month
     st.sidebar.multiselect("월 선택 (복수 가능)", list(range(1, 13)), default=[], key="selected_months")
+
 
 # ===== 진입 가드 =====
 if not st.session_state.get("authed", False):
@@ -844,6 +984,7 @@ if selected_orgs and demand_col_sidebar:
     df_filtered = df_filtered[df_filtered[demand_col_sidebar].isin(selected_orgs)]
 if service_selected and "서비스구분" in df_filtered.columns:
     df_filtered = df_filtered[df_filtered["서비스구분"].astype(str).isin(service_selected)]
+
 
 # =============================
 # 기본 분석(차트)
@@ -922,12 +1063,14 @@ def render_basic_analysis_charts(base_df: pd.DataFrame):
         )
         st.plotly_chart(fig2, use_container_width=True)
 
+
 # =============================
-# LLM 분석용 텍스트 추출 (Gemini 선시도 → 폴백)
+# LLM 분석용 텍스트 추출 (Gemini → HWP로컬 → 로컬기본 → CloudConvert)
 # =============================
 TEXT_EXTS = {".txt", ".csv", ".md", ".log"}
 DIRECT_PDF_EXTS = {".pdf"}
 BINARY_EXTS = {".hwp", ".hwpx", ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx"}
+
 
 def extract_text_combo_gemini_first(uploaded_files):
     combined_texts, convert_logs, generated_pdfs = [], [], []
@@ -937,7 +1080,7 @@ def extract_text_combo_gemini_first(uploaded_files):
         data = f.read()
         ext = (os.path.splitext(name)[1] or "").lower()
 
-        # 0) ✅ 모든 파일형식: Gemini가 파일 그대로 선추출 시도
+        # 0) ✅ 모든 파일형식 Gemini 선추출 시도
         gem_txt = gemini_try_extract_text_from_file(data, name)
         if gem_txt:
             convert_logs.append(f"🤖 {name}: Gemini 선 추출 성공 ({len(gem_txt)} chars)")
@@ -946,7 +1089,17 @@ def extract_text_combo_gemini_first(uploaded_files):
         else:
             convert_logs.append(f"🤖 {name}: Gemini 선 추출 실패 → 폴백 진행")
 
-        # 1) 텍스트 파일: 로컬 디코드
+        # 1) ✅ HWP/HWPX 로컬 olefile/zip TXT 추출 (중간단계)
+        if ext in {".hwp", ".hwpx"}:
+            try:
+                txt, fmt = convert_to_text(data, name)
+                convert_logs.append(f"📄 {name}: 로컬 {fmt} 텍스트 추출 성공 ({len(txt)} chars)")
+                combined_texts.append(f"\n\n===== [{name} | 로컬 {fmt} 추출] =====\n{_redact_secrets(txt)}\n")
+                continue
+            except Exception as e:
+                convert_logs.append(f"📄 {name}: 로컬 HWP/HWPX 추출 실패 ({e}) → 다음 단계")
+
+        # 2) 텍스트류 로컬 디코드
         if ext in TEXT_EXTS:
             for enc in ("utf-8-sig", "utf-8", "cp949", "euc-kr"):
                 try:
@@ -961,14 +1114,14 @@ def extract_text_combo_gemini_first(uploaded_files):
             combined_texts.append(f"\n\n===== [{name}] =====\n{_redact_secrets(txt)}\n")
             continue
 
-        # 2) PDF: 로컬 텍스트 추출
+        # 3) PDF 로컬 텍스트 추출
         if ext in DIRECT_PDF_EXTS:
             txt = extract_text_from_pdf_bytes(data)
             convert_logs.append(f"✅ {name}: 로컬 PDF 텍스트 추출 {len(txt)} chars")
             combined_texts.append(f"\n\n===== [{name}] =====\n{_redact_secrets(txt)}\n")
             continue
 
-        # 3) 그 외(바이너리): CloudConvert → PDF → 텍스트
+        # 4) 그 외 바이너리 CloudConvert 폴백
         if ext in BINARY_EXTS:
             pdf_bytes, dbg = cloudconvert_convert_to_pdf(data, name)
             if pdf_bytes:
@@ -983,6 +1136,7 @@ def extract_text_combo_gemini_first(uploaded_files):
         convert_logs.append(f"ℹ️ {name}: 미지원 형식(패스)")
 
     return "\n".join(combined_texts).strip(), convert_logs, generated_pdfs
+
 
 # =============================
 # 메뉴
@@ -1055,11 +1209,12 @@ elif menu_val == "내고객 분석하기":
 
                 # ===== Gemini 분석 =====
                 st.markdown("---")
-                st.subheader("🤖 Gemini 분석 (Gemini 선시도 → 폴백)")
+                st.subheader("🤖 Gemini 분석 (Gemini 선시도 → HWP로컬 → 로컬기본 → CloudConvert)")
                 st.caption(
-                    "0) 모든 파일(Gemini가 파일 그대로 선 추출 시도)\n"
-                    "1) 실패시 텍스트류/ PDF는 로컬 추출\n"
-                    "2) 나머지(hwp/hwpx/docx/pptx/xlsx 등) → CloudConvert PDF → 로컬 텍스트"
+                    "0) 모든 파일: Gemini가 파일 그대로 선추출 시도\n"
+                    "1) 실패 시 HWP/HWPX는 로컬 olefile/zip로 TXT 추출\n"
+                    "2) 실패 시 텍스트류/PDF 로컬 추출\n"
+                    "3) 나머지 바이너리: CloudConvert PDF → 로컬 텍스트"
                 )
 
                 src_files = st.file_uploader(
@@ -1112,13 +1267,23 @@ elif menu_val == "내고객 분석하기":
                                     st.session_state["generated_src_pdfs"] = generated_pdfs
 
                                     base_fname = f"{'_'.join(customers)}_Gemini분석_{datetime.now().strftime('%Y%m%d_%H%M')}"
-                                    st.download_button("📥 보고서 다운로드 (.md)", data=report.encode("utf-8"),
-                                                       file_name=f"{base_fname}.md", mime="text/markdown", use_container_width=True)
+                                    st.download_button(
+                                        "📥 보고서 다운로드 (.md)",
+                                        data=report.encode("utf-8"),
+                                        file_name=f"{base_fname}.md",
+                                        mime="text/markdown",
+                                        use_container_width=True
+                                    )
 
                                     pdf_bytes, dbg = markdown_to_pdf_korean(report, title="Gemini 분석 보고서")
                                     if pdf_bytes:
-                                        st.download_button("📥 보고서 다운로드 (.pdf)", data=pdf_bytes,
-                                                           file_name=f"{base_fname}.pdf", mime="application/pdf", use_container_width=True)
+                                        st.download_button(
+                                            "📥 보고서 다운로드 (.pdf)",
+                                            data=pdf_bytes,
+                                            file_name=f"{base_fname}.pdf",
+                                            mime="application/pdf",
+                                            use_container_width=True
+                                        )
                                         st.caption(f"PDF 생성 상태: {dbg}")
 
                                     if generated_pdfs:
