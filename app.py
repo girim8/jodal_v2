@@ -1,24 +1,19 @@
 # -*- coding: utf-8 -*-
-# app.py — Streamlit Cloud 단일 파일 통합본 (Gemini 버전)
-# - Secrets([[AUTH.users]], GEMINI_API_KEY, CLOUDCONVERT_API_KEY) 안정 파싱
+# app.py — Streamlit Cloud 단일 파일 통합본 (Gemini + CloudConvert 2단계 단순화 버전)
+# - Secrets([[AUTH.users]], GEMINI_API_KEY, CLOUDCONVERT_API_KEY)
 # - 로그인(팝업 없음) + 관리자 백도어(emp=2855, dob=910518)
 # - 업로드 엑셀(filtered 시트) 로드/필터/차트/다운로드
 # - 첨부 링크 매트릭스 + Compact 카드 UI
-# - 파일 변환 전략: 1) HWP/HWPX 로컬 텍스트→간이PDF  2) CloudConvert API → PDF
-# - **OpenAI 완전 제거 / Gemini generateContent API 적용**
-# - 보고서(.md/.pdf) 생성 + 변환 PDF 묶음 다운로드 + 컨텍스트 챗봇
-# - Python 3.11 기준
+# - LLM 분석 2단계:
+#   1) Gemini 선 사용(텍스트 기반: pdf/txt/csv/md/log)
+#   2) 불가 파일은 CloudConvert → PDF → 텍스트
+# - HWP/HWPX 로컬 변환/any→pdf/hwp5txt 삭제 완료
 
 import os
 import re
-import io
 import json
 import base64
-import zipfile
-import shutil
 import requests
-import tempfile
-import subprocess
 from io import BytesIO
 from urllib.parse import urlparse, unquote
 from textwrap import dedent
@@ -29,7 +24,6 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.express as px
-
 
 # =============================
 # 전역/메타
@@ -56,11 +50,11 @@ for k, v in {
     "chat_messages": [],
     "GEMINI_API_KEY": None,
     "role": None,
-    "svc_filter_seed": ["전용회선", "전화", "인터넷"],  # 업로드 전 안내용 seed
+    "svc_filter_seed": ["전용회선", "전화", "인터넷"],
+    "uploaded_file_obj": None,
 }.items():
     if k not in st.session_state:
         st.session_state[k] = v
-
 
 # =============================
 # 민감정보 마스킹
@@ -68,9 +62,7 @@ for k, v in {
 def _redact_secrets(text: str) -> str:
     if not isinstance(text, str):
         return text
-    # OpenAI 키 형태도 혹시 섞여있을 수 있으니 같이 마스킹
     text = re.sub(r"sk-[A-Za-z0-9_\-]{20,}", "[REDACTED_KEY]", text)
-    # Gemini 키(AIza...) 도 마스킹
     text = re.sub(r"AIza[0-9A-Za-z\-_]{20,}", "[REDACTED_GEMINI_KEY]", text)
     text = re.sub(
         r'(?i)\b(gpt_api_key|OPENAI_API_KEY|GEMINI_API_KEY|CLOUDCONVERT_API_KEY)\s*=\s*([\'\"]).*?\2',
@@ -78,7 +70,6 @@ def _redact_secrets(text: str) -> str:
         text,
     )
     return text
-
 
 # =============================
 # Secrets 헬퍼
@@ -97,7 +88,6 @@ def _get_auth_users_from_secrets() -> list:
         users = []
     return users
 
-
 def _get_gemini_key_from_secrets() -> str | None:
     try:
         key = st.secrets.get("GEMINI_API_KEY") if "GEMINI_API_KEY" in st.secrets else None
@@ -107,15 +97,12 @@ def _get_gemini_key_from_secrets() -> str | None:
         pass
     return None
 
-
 # =============================
-# Gemini (Google Generative Language API) 래퍼
+# Gemini API 래퍼
 # =============================
 GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
 
-
 def _get_gemini_key():
-    # 키 탐색: 세션 → secrets → env
     key = (
         st.session_state.get("GEMINI_API_KEY")
         or _get_gemini_key_from_secrets()
@@ -123,12 +110,7 @@ def _get_gemini_key():
     )
     return key.strip() if key else None
 
-
 def _gemini_messages_to_contents(messages):
-    """
-    OpenAI 스타일 messages -> Gemini contents 로 변환
-    - system은 첫 user prefix로 합침(가드레일/역할 부여)
-    """
     sys_texts = [m["content"] for m in messages if m.get("role") == "system"]
     user_assist = [m for m in messages if m.get("role") != "system"]
 
@@ -141,10 +123,8 @@ def _gemini_messages_to_contents(messages):
         role = m.get("role", "user")
         txt = _redact_secrets(m.get("content", ""))
 
-        # Gemini role: "user" / "model"
         gem_role = "user" if role == "user" else "model"
 
-        # 첫 user 메시지에 system prefix 주입
         if not contents and gem_role == "user" and sys_prefix:
             txt = sys_prefix + txt
 
@@ -157,12 +137,7 @@ def _gemini_messages_to_contents(messages):
         contents = [{"role": "user", "parts": [{"text": sys_prefix}]}]
     return contents
 
-
 def call_gemini(messages, temperature=0.4, max_tokens=2000, model="gemini-2.0-flash"):
-    """
-    - Google Generative Language API generateContent 사용
-    - messages: [{"role":"system|user|assistant","content":"..."}]
-    """
     key = _get_gemini_key()
     if not key:
         raise Exception("Gemini API 키 미설정 (st.secrets.GEMINI_API_KEY 또는 사이드바 입력)")
@@ -177,9 +152,7 @@ def call_gemini(messages, temperature=0.4, max_tokens=2000, model="gemini-2.0-fl
         """).strip()
     }
 
-    safe_messages = [guardrail_system]
-    safe_messages.extend(messages)
-
+    safe_messages = [guardrail_system] + messages
     contents = _gemini_messages_to_contents(safe_messages)
 
     payload = {
@@ -191,10 +164,7 @@ def call_gemini(messages, temperature=0.4, max_tokens=2000, model="gemini-2.0-fl
     }
 
     url = f"{GEMINI_API_BASE}/{model}:generateContent"
-    headers = {
-        "Content-Type": "application/json",
-        "X-goog-api-key": key
-    }
+    headers = {"Content-Type": "application/json", "X-goog-api-key": key}
 
     try:
         r = requests.post(url, headers=headers, data=json.dumps(payload), timeout=60)
@@ -216,40 +186,28 @@ def call_gemini(messages, temperature=0.4, max_tokens=2000, model="gemini-2.0-fl
 
     raise Exception("Gemini 응답이 비어있습니다.")
 
-
 # =============================
-# CloudConvert API 헬퍼
+# CloudConvert API (2차 변환 전용)
 # =============================
 CLOUDCONVERT_API_BASE = "https://api.cloudconvert.com/v2"
 
-
 def _get_cloudconvert_key() -> str | None:
-    key = None
     try:
         key = st.secrets.get("CLOUDCONVERT_API_KEY") if "CLOUDCONVERT_API_KEY" in st.secrets else None
     except Exception:
         key = None
     return key or os.environ.get("CLOUDCONVERT_API_KEY")
 
-
 @st.cache_data(show_spinner=False)
 def _cloudconvert_supported() -> bool:
     return _get_cloudconvert_key() is not None
 
-
-def cloudconvert_convert_to_pdf(file_bytes: bytes, filename: str, timeout_sec: int = 120) -> tuple[bytes | None, str]:
-    """
-    CloudConvert v2 Jobs API 사용
-    - import/base64 → convert(pdf) → export/url
-    - 완료 후 export URL에서 결과 pdf 다운로드
-    """
+def cloudconvert_convert_to_pdf(file_bytes: bytes, filename: str, timeout_sec: int = 180) -> tuple[bytes | None, str]:
     api_key = _get_cloudconvert_key()
     if not api_key:
         return None, "CloudConvert 키 없음(st.secrets.CLOUDCONVERT_API_KEY)"
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
+
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     job_payload = {
         "tasks": {
             "import-my-file": {
@@ -270,6 +228,7 @@ def cloudconvert_convert_to_pdf(file_bytes: bytes, filename: str, timeout_sec: i
             },
         }
     }
+
     try:
         r = requests.post(f"{CLOUDCONVERT_API_BASE}/jobs", headers=headers, data=json.dumps(job_payload), timeout=30)
         r.raise_for_status()
@@ -298,7 +257,6 @@ def cloudconvert_convert_to_pdf(file_bytes: bytes, filename: str, timeout_sec: i
             time.sleep(2)
         except Exception:
             time.sleep(2)
-            continue
 
     if not export_files:
         return None, "CloudConvert 변환 대기 타임아웃/실패"
@@ -307,21 +265,19 @@ def cloudconvert_convert_to_pdf(file_bytes: bytes, filename: str, timeout_sec: i
         url = export_files[0].get("url")
         if not url:
             return None, "CloudConvert export URL 없음"
-        dr = requests.get(url, timeout=60)
+        dr = requests.get(url, timeout=90)
         dr.raise_for_status()
         return dr.content, "OK[CloudConvert]"
     except Exception as e:
         return None, f"CloudConvert 다운로드 실패: {e}"
 
-
 # =============================
-# HWP/HWPX 로컬 1차: 텍스트 → 간이PDF
+# PDF 텍스트 추출 / Markdown→PDF(보고서용)
 # =============================
 try:
     from PyPDF2 import PdfReader
 except Exception:
     PdfReader = None  # type: ignore
-
 
 def extract_text_from_pdf_bytes(file_bytes: bytes) -> str:
     try:
@@ -331,71 +287,6 @@ def extract_text_from_pdf_bytes(file_bytes: bytes) -> str:
         return "\n".join([(p.extract_text() or "") for p in reader.pages]).strip()
     except Exception as e:
         return f"[PDF 추출 실패] {e}"
-
-
-def convert_hwp_with_pyhwp(file_bytes: bytes):
-    """pyhwp 또는 hwp5txt CLI를 통해 텍스트를 얻는다 (환경에 존재할 때만)."""
-    # 1) pyhwp 모듈
-    try:
-        import importlib
-        has_pyhwp = importlib.util.find_spec("pyhwp") is not None
-        if has_pyhwp:
-            try:
-                from pyhwp.hwp5.dataio import HWP5File
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".hwp") as tmp:
-                    tmp.write(file_bytes)
-                    path = tmp.name
-                try:
-                    doc = HWP5File(path)
-                    text = doc.text
-                    return (text or "").strip(), "OK[pyhwp]"
-                finally:
-                    try:
-                        os.unlink(path)
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-    except Exception:
-        pass
-    # 2) hwp5txt CLI
-    try:
-        exe = shutil.which("hwp5txt") or shutil.which("hwp5txt.py")
-        if exe:
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".hwp") as tmp:
-                tmp.write(file_bytes)
-                path = tmp.name
-            try:
-                cp = subprocess.run([exe, path], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
-                if cp.returncode == 0:
-                    return cp.stdout.decode("utf-8", errors="ignore"), "OK[hwp5txt]"
-            finally:
-                try:
-                    os.unlink(path)
-                except Exception:
-                    pass
-    except Exception:
-        pass
-    return None, "pyhwp/hwp5txt 텍스트 추출 실패"
-
-
-def extract_text_from_hwpx_bytes(file_bytes: bytes) -> str:
-    try:
-        texts = []
-        with zipfile.ZipFile(BytesIO(file_bytes)) as zf:
-            xmls = [n for n in zf.namelist() if n.lower().endswith(".xml")]
-            for name in xmls:
-                try:
-                    xml = zf.read(name).decode("utf-8", errors="ignore")
-                    txt = re.sub(r"<[^>]+>", " ", xml)
-                    texts.append(txt)
-                except Exception:
-                    continue
-        out = re.sub(r"\s{2,}", " ", "\n".join(texts)).strip()
-        return out if out else "[HWPX 추출 결과 비어있음]"
-    except Exception as e:
-        return f"[HWPX 추출 실패] {e}"
-
 
 def text_to_pdf_bytes_korean(text: str, title: str = ""):
     try:
@@ -449,73 +340,11 @@ def text_to_pdf_bytes_korean(text: str, title: str = ""):
         doc.build(flow)
         buf.seek(0)
         return buf.read(), "OK[ReportLab]"
-
     except Exception as e:
-        try:
-            from PIL import Image, ImageDraw, ImageFont
-            DPI = 300
-            A4_W, A4_H = int(8.27 * DPI), int(11.69 * DPI)
-            L, R, T, B = int(0.6 * DPI), int(0.6 * DPI), int(0.7 * DPI), int(0.7 * DPI)
-            img = Image.new("L", (A4_W, A4_H), 255)
-            draw = ImageDraw.Draw(img)
-            font = ImageFont.load_default()
+        return None, f"PDF 생성 실패: {e}"
 
-            x, y = L, T
-            lines = (title + "\n\n" + (text or "")).split("\n") if title else (text or "").split("\n")
-            pages, h = [], 22
-            for ln in lines:
-                if y + h > A4_H - B:
-                    pages.append(img)
-                    img = Image.new("L", (A4_W, A4_H), 255)
-                    draw = ImageDraw.Draw(img)
-                    y = T
-                draw.text((x, y), ln, 0, font)
-                y += h
-            pages.append(img)
-
-            bio = BytesIO()
-            pages[0].save(bio, format="PDF", save_all=True, append_images=pages[1:])
-            bio.seek(0)
-            return bio.read(), f"OK[Pillow] (ReportLab Error: {e})"
-        except Exception as e2:
-            return None, f"PDF 생성 실패: {e2}"
-
-
-# =============================
-# any → PDF 변환
-# =============================
-ALLOWED_UPLOAD_EXTS = {
-    ".pdf", ".hwp", ".hwpx", ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx",
-    ".txt", ".csv", ".md", ".log"
-}
-
-
-def convert_any_to_pdf(file_bytes: bytes, filename: str) -> tuple[bytes | None, str]:
-    ext = (os.path.splitext(filename)[1] or "").lower()
-
-    # HWP (로컬 → 실패 시 CloudConvert)
-    if ext == ".hwp":
-        t, dbg = convert_hwp_with_pyhwp(file_bytes)
-        if t:
-            pdf, dbg2 = text_to_pdf_bytes_korean(t, title=os.path.basename(filename))
-            if pdf:
-                return pdf, f"{dbg} → {dbg2}"
-        return cloudconvert_convert_to_pdf(file_bytes, filename)
-
-    # HWPX (로컬 → 실패 시 CloudConvert)
-    if ext == ".hwpx":
-        t = extract_text_from_hwpx_bytes(file_bytes)
-        if t and not t.startswith("[HWPX 추출 실패]"):
-            pdf, dbg2 = text_to_pdf_bytes_korean(t, title=os.path.basename(filename))
-            if pdf:
-                return pdf, dbg2
-        return cloudconvert_convert_to_pdf(file_bytes, filename)
-
-    if ext == ".pdf":
-        return file_bytes, "이미 PDF"
-
-    return cloudconvert_convert_to_pdf(file_bytes, filename)
-
+def markdown_to_pdf_korean(md_text: str, title: str | None = None):
+    return text_to_pdf_bytes_korean(md_text, title or "")
 
 # =============================
 # 첨부 링크 매트릭스 (Compact 카드 UI)
@@ -538,11 +367,9 @@ CSS_COMPACT = """
 </style>
 """
 
-
 def _is_url(val: str) -> bool:
     s = str(val).strip()
     return s.startswith("http://") or s.startswith("https://")
-
 
 def _filename_from_url(url: str) -> str:
     try:
@@ -552,7 +379,6 @@ def _filename_from_url(url: str) -> str:
         return unquote(path.split("/")[-1]) or url
     except Exception:
         return url
-
 
 def build_attachment_matrix(df_like: pd.DataFrame, title_col: str) -> pd.DataFrame:
     if title_col not in df_like.columns:
@@ -620,9 +446,7 @@ def build_attachment_matrix(df_like: pd.DataFrame, title_col: str) -> pd.DataFra
                 "기타": join_html(catmap["기타"]),
             }
         )
-    out_df = pd.DataFrame(rows).sort_values(by=[title_col]).reset_index(drop=True)
-    return out_df
-
+    return pd.DataFrame(rows).sort_values(by=[title_col]).reset_index(drop=True)
 
 def render_attachment_cards_html(df_links: pd.DataFrame, title_col: str) -> str:
     cat_cols = ["본공고링크", "제안요청서", "공고서", "과업지시서", "규격서", "기타"]
@@ -655,7 +479,6 @@ def render_attachment_cards_html(df_links: pd.DataFrame, title_col: str) -> str:
     html.append('</div>')
     return "\n".join(html)
 
-
 # =============================
 # 벤더 정규화/색상
 # =============================
@@ -666,7 +489,6 @@ VENDOR_COLOR_MAP = {
     "에스케이텔레콤": "#1E90FF",
 }
 OTHER_SEQ = ["#2E8B57", "#6B8E23", "#556B2F", "#8B4513", "#A0522D", "#CD853F", "#228B22", "#006400"]
-
 
 def normalize_vendor(name: str) -> str:
     s = str(name) if pd.notna(name) else ""
@@ -680,12 +502,10 @@ def normalize_vendor(name: str) -> str:
         return "에스케이텔레콤"
     return s or "기타"
 
-
 # =============================
 # 로그인 게이트 & 사이드바
 # =============================
 INFO_BOX = "사번/생년월일은 사내 배포용으로만 사용됩니다."
-
 
 def login_gate():
     st.title("🔐 로그인")
@@ -711,10 +531,18 @@ def login_gate():
     with col2:
         st.info(INFO_BOX)
 
-
-def render_sidebar_common():
+def render_sidebar_base():
     st.sidebar.title("📂 데이터 업로드")
-    st.sidebar.file_uploader("filtered 시트가 포함된 병합 엑셀 업로드 (.xlsx)", type=["xlsx"], key="uploaded_file")
+
+    # ✅ 업로더 값을 즉시 받아 세션에 저장 (빈칸 표시/미반영 이슈 방지)
+    up = st.sidebar.file_uploader(
+        "filtered 시트가 포함된 병합 엑셀 업로드 (.xlsx)",
+        type=["xlsx"],
+        key="uploaded_file"
+    )
+    if up is not None:
+        st.session_state["uploaded_file_obj"] = up
+
     st.sidebar.radio("# 📋 메뉴 선택", ["조달입찰결과현황", "내고객 분석하기"], key="menu")
 
     # Gemini 키
@@ -733,39 +561,77 @@ def render_sidebar_common():
             else:
                 st.warning("유효한 Gemini 키를 입력하세요 (AIza...).")
 
-    if _get_gemini_key_from_secrets() or os.environ.get("GEMINI_API_KEY") or st.session_state.get("GEMINI_API_KEY"):
+    if _get_gemini_key():
         st.sidebar.success("Gemini 사용 가능")
     else:
         st.sidebar.warning("Gemini 비활성 — st.secrets.GEMINI_API_KEY 설정 필요")
 
-    # CloudConvert 키 상태
     if _cloudconvert_supported():
         st.sidebar.success("CloudConvert 사용 가능")
     else:
         st.sidebar.warning("CloudConvert 비활성 — st.secrets.CLOUDCONVERT_API_KEY 설정 필요")
 
     st.session_state.setdefault("gpt_extra_req", "")
-    st.sidebar.text_area("🤖 Gemini 추가 요구사항(선택)", height=100, placeholder="예) 'MACsec, SRv6 강조', '세부 일정 표 추가' 등", key="gpt_extra_req")
+    st.sidebar.text_area("🤖 Gemini 추가 요구사항(선택)", height=100,
+                         placeholder="예) 'MACsec, SRv6 강조', '세부 일정 표 추가' 등",
+                         key="gpt_extra_req")
 
-    st.title("📊 조달입찰 분석 시스템")
-    st.caption("좌측에서 파일 업로드 후 메뉴를 선택하세요. ‘서비스구분’ 기본값은 전용회선/전화/인터넷입니다.")
+def render_sidebar_filters(df: pd.DataFrame):
+    # 업로드 후에만 보이는 필터 영역
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("🧰 필터")
 
+    # 서비스구분
+    if "서비스구분" in df.columns:
+        options = sorted([str(x) for x in df["서비스구분"].dropna().unique()])
+        defaults = [x for x in st.session_state.get("svc_filter_seed", SERVICE_DEFAULT) if x in options] or \
+                   [x for x in SERVICE_DEFAULT if x in options] or options[:3]
+        st.sidebar.multiselect(
+            "서비스구분 선택",
+            options=options,
+            default=defaults,
+            key="svc_filter_ms",
+        )
+
+    st.sidebar.subheader("🔍 부가 필터")
+    st.sidebar.checkbox("(필터)낙찰자선정여부 = 'Y' 만 보기", value=True, key="only_winner")
+
+    if "대표업체" in df.columns:
+        company_list = sorted(df["대표업체"].dropna().unique())
+        st.sidebar.multiselect("대표업체 필터 (복수 가능)", company_list, key="selected_companies")
+
+    demand_col_sidebar = "수요기관명" if "수요기관명" in df.columns else ("수요기관" if "수요기관" in df.columns else None)
+    if demand_col_sidebar:
+        org_list = sorted(df[demand_col_sidebar].dropna().unique())
+        st.sidebar.multiselect(f"{demand_col_sidebar} 필터 (복수 가능)", org_list, key="selected_orgs")
+
+    st.sidebar.subheader("📆 공고게시일자 필터")
+    if "공고게시일자_date" in df.columns:
+        df["_tmp_date"] = pd.to_datetime(df["공고게시일자_date"], errors="coerce")
+    else:
+        df["_tmp_date"] = pd.NaT
+
+    df["_tmp_year"] = df["_tmp_date"].dt.year
+    year_list = sorted([int(x) for x in df["_tmp_year"].dropna().unique()])
+    st.sidebar.multiselect("연도 선택 (복수 가능)", year_list, default=[], key="selected_years")
+
+    df["_tmp_month"] = df["_tmp_date"].dt.month
+    st.sidebar.multiselect("월 선택 (복수 가능)", list(range(1, 13)), default=[], key="selected_months")
 
 # ===== 진입 가드 =====
 if not st.session_state.get("authed", False):
     login_gate()
     st.stop()
 
-# 로그인 성공 후 사이드바 표시
-render_sidebar_common()
-
+render_sidebar_base()
 
 # =============================
-# 업로드/데이터 로드
+# 업로드/데이터 로드 (업로드가 없으면 메인만 안내)
 # =============================
-uploaded_file = st.session_state.get("uploaded_file")
+uploaded_file = st.session_state.get("uploaded_file_obj")
 if not uploaded_file:
-    st.info("좌측에서 'filtered' 시트를 포함한 엑셀 파일을 업로드하세요.")
+    st.title("📊 조달입찰 분석 시스템")
+    st.caption("좌측 사이드바에서 'filtered' 시트를 포함한 엑셀 파일을 업로드하세요.")
     st.stop()
 
 try:
@@ -776,57 +642,30 @@ except Exception as e:
 
 df_original = df.copy()
 
+# 업로드 이후 필터 사이드바 렌더
+render_sidebar_filters(df_original)
 
 # =============================
-# 동적 사이드바 필터 옵션 (업로드 후 실제 생성)
+# 사이드바 필터 값 읽기 & 적용
 # =============================
-if "서비스구분" in df.columns:
-    options = sorted([str(x) for x in df["서비스구분"].dropna().unique()])
-    defaults = [x for x in st.session_state.get("svc_filter_seed", SERVICE_DEFAULT) if x in options] or \
-               [x for x in SERVICE_DEFAULT if x in options] or options[:3]
-    service_selected = st.sidebar.multiselect(
-        "서비스구분 선택",
-        options=options,
-        default=defaults,
-        key="svc_filter_ms",
-    )
-else:
-    service_selected = []
-
-st.sidebar.markdown("---")
-st.sidebar.subheader("🔍 부가 필터")
-
-only_winner = st.sidebar.checkbox("(필터)낙찰자선정여부 = 'Y' 만 보기", value=True)
-
-if "대표업체" in df.columns:
-    company_list = sorted(df["대표업체"].dropna().unique())
-    selected_companies = st.sidebar.multiselect("대표업체 필터 (복수 가능)", company_list)
-else:
-    selected_companies = []
+service_selected = st.session_state.get("svc_filter_ms", [])
+only_winner = st.session_state.get("only_winner", True)
+selected_companies = st.session_state.get("selected_companies", [])
+selected_orgs = st.session_state.get("selected_orgs", [])
+selected_years = st.session_state.get("selected_years", [])
+selected_months = st.session_state.get("selected_months", [])
 
 demand_col_sidebar = "수요기관명" if "수요기관명" in df.columns else ("수요기관" if "수요기관" in df.columns else None)
-if demand_col_sidebar:
-    org_list = sorted(df[demand_col_sidebar].dropna().unique())
-    selected_orgs = st.sidebar.multiselect(f"{demand_col_sidebar} 필터 (복수 가능)", org_list)
-else:
-    selected_orgs = []
 
-st.sidebar.subheader("📆 공고게시일자 필터")
-if "공고게시일자_date" in df.columns:
-    df["공고게시일자_date"] = pd.to_datetime(df["공고게시일자_date"], errors="coerce")
-else:
-    df["공고게시일자_date"] = pd.NaT
-
-df["year"] = df["공고게시일자_date"].dt.year
-year_list = sorted([int(x) for x in df["year"].dropna().unique()])
-selected_years = st.sidebar.multiselect("연도 선택 (복수 가능)", year_list, default=[])
-
-month_list = list(range(1, 13))
-df["month"] = df["공고게시일자_date"].dt.month
-selected_months = st.sidebar.multiselect("월 선택 (복수 가능)", month_list, default=[])
-
-# 필터 적용
 df_filtered = df.copy()
+if "공고게시일자_date" in df_filtered.columns:
+    df_filtered["공고게시일자_date"] = pd.to_datetime(df_filtered["공고게시일자_date"], errors="coerce")
+else:
+    df_filtered["공고게시일자_date"] = pd.NaT
+
+df_filtered["year"] = df_filtered["공고게시일자_date"].dt.year
+df_filtered["month"] = df_filtered["공고게시일자_date"].dt.month
+
 if selected_years:
     df_filtered = df_filtered[df_filtered["year"].isin(selected_years)]
 if selected_months:
@@ -839,22 +678,6 @@ if selected_orgs and demand_col_sidebar:
     df_filtered = df_filtered[df_filtered[demand_col_sidebar].isin(selected_orgs)]
 if service_selected and "서비스구분" in df_filtered.columns:
     df_filtered = df_filtered[df_filtered["서비스구분"].astype(str).isin(service_selected)]
-
-
-# =============================
-# 공통 유틸
-# =============================
-def _safe_filename(name: str) -> str:
-    name = (name or "").strip().replace("\n", "_").replace("\r", "_")
-    name = re.sub(r'[\\/:*?"<>|]+', "_", name)
-    if not name.lower().endswith(".pdf"):
-        name += ".pdf"
-    return name[:160]
-
-
-def markdown_to_pdf_korean(md_text: str, title: str | None = None):
-    return text_to_pdf_bytes_korean(md_text, title or "")
-
 
 # =============================
 # 기본 분석(차트)
@@ -871,12 +694,7 @@ def render_basic_analysis_charts(base_df: pd.DataFrame):
             return ("원", 1)
 
     def apply_unit(values: pd.Series, mode: str = "자동"):
-        unit_map = {
-            "원": ("원", 1),
-            "백만원": ("백만원", 1_000_000),
-            "억원": ("억원", 100_000_000),
-            "조원": ("조원", 1_0000_0000_0000),
-        }
+        unit_map = {"원": ("원", 1), "백만원": ("백만원", 1_000_000), "억원": ("억원", 100_000_000), "조원": ("조원", 1_0000_0000_0000)}
         if mode == "자동":
             u, f = pick_unit(values.max() if len(values) else 0)
             return values / f, u
@@ -922,14 +740,7 @@ def render_basic_analysis_charts(base_df: pd.DataFrame):
                 color_discrete_map=VENDOR_COLOR_MAP,
                 color_discrete_sequence=OTHER_SEQ,
             )
-            fig1.update_traces(
-                hovertemplate="<b>%{label}</b><br>금액: %{value:,.2f} " + unit_label + "<br>비중: %{percent}",
-                texttemplate="%{label}<br>%{value:,.2f} " + unit_label,
-                textposition="auto",
-            )
             st.plotly_chart(fig1, use_container_width=True)
-        else:
-            st.info("투찰금액 컬럼이 없어 파이차트(금액)를 생략합니다.")
 
     with col_pie2:
         cnt_by_company = dwin["대표업체_표시"].value_counts().reset_index()
@@ -943,183 +754,71 @@ def render_basic_analysis_charts(base_df: pd.DataFrame):
             color_discrete_map=VENDOR_COLOR_MAP,
             color_discrete_sequence=OTHER_SEQ,
         )
-        fig2.update_traces(
-            hovertemplate="<b>%{label}</b><br>건수: %{value:,}건<br>비중: %{percent}",
-            texttemplate="%{label}<br>%{value:,}건",
-            textposition="auto",
-        )
         st.plotly_chart(fig2, use_container_width=True)
 
-    st.markdown("### 2) 낙찰 특성 비율")
-    c1, c2 = st.columns(2)
-    with c1:
-        if "낙찰방법" in dwin.columns:
-            total = len(dwin)
-            suyi = (dwin["낙찰방법"] == "수의시담").sum()
-            st.metric(label="수의시담 비율", value=f"{(suyi / total * 100 if total else 0):.1f}%")
-        else:
-            st.info("낙찰방법 컬럼 없음")
-    with c2:
-        if "긴급공고" in dwin.columns:
-            total = len(dwin)
-            urgent = (dwin["긴급공고"] == "Y").sum()
-            st.metric(label="긴급공고 비율", value=f"{(urgent / total * 100 if total else 0):.1f}%")
-        else:
-            st.info("긴급공고 컬럼 없음")
+# =============================
+# LLM 분석용 텍스트 추출 (2단계 단순화)
+# =============================
+TEXT_EXTS = {".txt", ".csv", ".md", ".log"}
+DIRECT_PDF_EXTS = {".pdf"}
+BINARY_EXTS = {".hwp", ".hwpx", ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx"}
 
-    st.markdown("### 3) 투찰율 산점도  &  4) 업체/년도별 수주금액")
-    col_scatter, col_bar3 = st.columns(2)
-    with col_scatter:
-        if "투찰율" in dwin.columns:
-            dwin["공고게시일자_date"] = pd.to_datetime(dwin.get("공고게시일자_date", pd.NaT), errors="coerce")
-            dplot = dwin.dropna(subset=["투찰율", "공고게시일자_date"]).copy()
-            dplot = dplot[dplot["투찰율"] <= 300]
-            hover_cols = [c for c in ["대표업체_표시", "수요기관명", "공고명", "입찰공고명", "입찰공고번호"] if c in dplot.columns]
-            fig_scatter = px.scatter(
-                dplot,
-                x="공고게시일자_date",
-                y="투찰율",
-                hover_data=hover_cols,
-                title="투찰율 산점도",
-                color="대표업체_표시",
-                color_discrete_map=VENDOR_COLOR_MAP,
-                color_discrete_sequence=OTHER_SEQ,
-            )
-            st.plotly_chart(fig_scatter, use_container_width=True)
-        else:
-            st.info("투찰율 컬럼 없음 - 산점도 생략")
+def extract_text_combo_2step(uploaded_files):
+    combined_texts, convert_logs, generated_pdfs = [], [], []
 
-    with col_bar3:
-        if "투찰금액" in dwin.columns:
-            dyear = dwin.copy()
-            dyear["연도"] = pd.to_datetime(dyear.get("공고게시일자_date", pd.NaT), errors="coerce").dt.year
-            dyear = dyear.dropna(subset=["연도"]).astype({"연도": int})
-            by_vendor_year = dyear.groupby(["연도", "대표업체_표시"])["투찰금액"].sum().reset_index()
-            fig_vy = px.bar(
-                by_vendor_year,
-                x="연도",
-                y="투찰금액",
-                color="대표업체_표시",
-                barmode="group",
-                title="업체/년도별 수주금액",
-                color_discrete_map=VENDOR_COLOR_MAP,
-                color_discrete_sequence=OTHER_SEQ,
-            )
-            fig_vy.update_traces(hovertemplate="<b>%{x}년</b><br>%{legendgroup}: %{y:,.0f} 원")
-            st.plotly_chart(fig_vy, use_container_width=True)
-        else:
-            st.info("투찰금액 컬럼이 없어 '업체/년도별 수주금액'을 표시할 수 없습니다.")
+    for f in uploaded_files:
+        name = f.name
+        data = f.read()
+        ext = (os.path.splitext(name)[1] or "").lower()
 
-    st.markdown("### 5) 연·분기별 배정예산금액 — 누적 막대 & 총합")
-    col_stack, col_total = st.columns(2)
-    if "배정예산금액" not in dwin.columns:
-        with col_stack:
-            st.info("배정예산금액 컬럼 없음 - 막대그래프 생략")
-        return
-    dwin["공고게시일자_date"] = pd.to_datetime(dwin.get("공고게시일자_date", pd.NaT), errors="coerce")
-    g = dwin.dropna(subset=["공고게시일자_date"]).copy()
-    if g.empty:
-        with col_stack:
-            st.info("유효한 날짜가 없어 그래프 표시 불가")
-        return
-    g["연도"] = g["공고게시일자_date"].dt.year
-    g["분기"] = g["공고게시일자_date"].dt.quarter
-    g["연도분기"] = g["연도"].astype(str) + " Q" + g["분기"].astype(str)
-    if "대표업체_표시" not in g.columns:
-        g["대표업체_표시"] = g.get("대표업체", pd.Series([""] * len(g))).map(normalize_vendor)
-
-    title_col = "입찰공고명" if "입찰공고명" in g.columns else ("공고명" if "공고명" in g.columns else None)
-    group_col = "대표업체_표시"
-    if group_col not in g.columns:
-        with col_stack:
-            st.info("대표업체_표시 컬럼 없음")
-        return
-
-    with col_stack:
-        grp = g.groupby(["연도분기", group_col])["배정예산금액"].sum().reset_index(name="금액합")
-        if not grp.empty:
-            if title_col:
-                title_map = (
-                    g.groupby(["연도분기", group_col])[title_col]
-                    .apply(lambda s: " | ".join(pd.Series(s).dropna().astype(str).unique()[:10]))
-                    .rename("입찰공고목록")
-                    .reset_index()
-                )
-                grp = grp.merge(title_map, on=["연도분기", group_col], how="left")
-                grp["입찰공고목록"] = grp["입찰공고목록"].fillna("")
+        # 1) 텍스트 파일: 바로 읽기
+        if ext in TEXT_EXTS:
+            for enc in ("utf-8-sig", "utf-8", "cp949", "euc-kr"):
+                try:
+                    txt = data.decode(enc)
+                    break
+                except Exception:
+                    continue
             else:
-                grp["입찰공고목록"] = ""
+                txt = data.decode("utf-8", errors="ignore")
 
-            grp["연"] = grp["연도분기"].str.extract(r"(\d{4})").astype(int)
-            grp["분"] = grp["연도분기"].str.extract(r"Q(\d)").astype(int)
-            grp = grp.sort_values(["연", "분", group_col]).reset_index(drop=True)
-            ordered_quarters = grp.sort_values(["연", "분"])["연도분기"].unique()
-            grp["연도분기"] = pd.Categorical(grp["연도분기"], categories=ordered_quarters, ordered=True)
+            convert_logs.append(f"🗒️ {name}: 텍스트 로드 완료")
+            combined_texts.append(f"\n\n===== [{name}] =====\n{_redact_secrets(txt)}\n")
+            continue
 
-            custom = np.column_stack([grp[group_col].astype(str).to_numpy(),
-                                      grp["입찰공고목록"].astype(str).to_numpy()])
-            fig_stack = px.bar(
-                grp,
-                x="연도분기",
-                y="금액합",
-                color=group_col,
-                barmode="stack",
-                title=f"연·분기별 배정예산금액 — 누적(스택) / 그룹: {group_col}",
-                color_discrete_map=VENDOR_COLOR_MAP,
-                color_discrete_sequence=OTHER_SEQ,
-            )
-            fig_stack.update_traces(
-                customdata=custom,
-                hovertemplate=(
-                    "<b>%{x}</b><br>"
-                    f"{group_col}: %{{customdata[0]}}<br>"
-                    "금액: %{{y:,.0f}} 원<br>"
-                    "입찰공고명: %{{customdata[1]}}"
-                ),
-            )
-            fig_stack.update_layout(xaxis_title="연도분기", yaxis_title="배정예산금액 (원)",
-                                    margin=dict(l=10, r=10, t=60, b=10))
-            st.plotly_chart(fig_stack, use_container_width=True)
-        else:
-            st.info("그룹핑 결과가 비어 있습니다.")
+        # 2) PDF: 텍스트 추출
+        if ext in DIRECT_PDF_EXTS:
+            txt = extract_text_from_pdf_bytes(data)
+            convert_logs.append(f"✅ {name}: PDF 텍스트 추출 {len(txt)} chars")
+            combined_texts.append(f"\n\n===== [{name}] =====\n{_redact_secrets(txt)}\n")
+            continue
 
-    with col_total:
-        grp_total = g.groupby("연도분기")["배정예산금액"].sum().reset_index(name="금액합")
-        grp_total["연"] = grp_total["연도분기"].str.extract(r"(\d{4})").astype(int)
-        grp_total["분"] = grp_total["연도분기"].str.extract(r"Q(\d)").astype(int)
-        grp_total = grp_total.sort_values(["연", "분"])
+        # 3) 그 외(바이너리): CloudConvert → PDF → 텍스트
+        if ext in BINARY_EXTS:
+            pdf_bytes, dbg = cloudconvert_convert_to_pdf(data, name)
+            if pdf_bytes:
+                generated_pdfs.append((os.path.splitext(name)[0] + ".pdf", pdf_bytes))
+                txt = extract_text_from_pdf_bytes(pdf_bytes)
+                convert_logs.append(f"✅ {name} → CloudConvert PDF 성공 ({dbg}), 텍스트 {len(txt)} chars")
+                combined_texts.append(f"\n\n===== [{name} → CloudConvert PDF] =====\n{_redact_secrets(txt)}\n")
+            else:
+                convert_logs.append(f"🛑 {name}: CloudConvert 실패 ({dbg})")
+            continue
 
-        if title_col:
-            titles_total = (
-                g.groupby("연도분기")[title_col]
-                .apply(lambda s: " | ".join(pd.Series(s).dropna().astype(str).unique()[:10]))
-                .reindex(grp_total["연도분기"]).fillna("")
-            )
-            custom2 = np.stack([titles_total], axis=-1)
-        else:
-            custom2 = np.stack([pd.Series([""] * len(grp_total))], axis=-1)
+        convert_logs.append(f"ℹ️ {name}: 미지원 형식(패스)")
 
-        fig_bar = px.bar(grp_total, x="연도분기", y="금액합", title="연·분기별 배정예산금액 (총합)", text="금액합")
-        fig_bar.update_traces(
-            customdata=custom2,
-            hovertemplate="<b>%{x}</b><br>총액: %{y:,.0f} 원<br>입찰공고명: %{customdata[0]}",
-            texttemplate="%{text:,.0f}",
-            textposition="outside",
-            cliponaxis=False,
-        )
-        st.plotly_chart(fig_bar, use_container_width=True)
+    return "\n".join(combined_texts).strip(), convert_logs, generated_pdfs
 
 
 # =============================
-# 메뉴: 조달입찰결과현황 / 내고객 분석하기
+# 메뉴
 # =============================
 menu_val = st.session_state.get("menu")
 
 if menu_val == "조달입찰결과현황":
     st.title("📑 조달입찰결과현황")
     dl_buf = BytesIO()
-    df_filtered.to_excel(dl_buf, index=False, engine="openpyxl")
-    dl_buf.seek(0)
+    df_filtered.to_excel(dl_buf, index=False, engine="openpyxl"); dl_buf.seek(0)
     st.download_button(
         label="📥 필터링된 데이터 다운로드 (Excel)",
         data=dl_buf,
@@ -1137,16 +836,12 @@ elif menu_val == "내고객 분석하기":
     demand_col = None
     for col in ["수요기관명", "수요기관", "기관명"]:
         if col in df_original.columns:
-            demand_col = col
-            break
+            demand_col = col; break
     if not demand_col:
-        st.error("⚠️ 수요기관 관련 컬럼을 찾을 수 없습니다.")
-        st.stop()
-
+        st.error("⚠️ 수요기관 관련 컬럼을 찾을 수 없습니다."); st.stop()
     st.success(f"✅ 검색 대상 컬럼: **{demand_col}**")
 
-    customer_input = st.text_input(f"고객사명을 입력하세요 ({demand_col} 기준, 쉼표로 복수 입력 가능)",
-                                   help="예) 조달청, 국방부")
+    customer_input = st.text_input(f"고객사명을 입력하세요 ({demand_col} 기준, 쉼표로 복수 입력 가능)", help="예) 조달청, 국방부")
 
     with st.expander(f"📋 전체 {demand_col} 목록 보기 (검색 참고용)"):
         unique_orgs = sorted(df_original[demand_col].dropna().unique())
@@ -1161,9 +856,7 @@ elif menu_val == "내고객 분석하기":
             result = df_original[df_original[demand_col].isin(customers)]
             st.subheader(f"📊 검색 결과: {len(result)}건")
             if not result.empty:
-                rb = BytesIO()
-                result.to_excel(rb, index=False, engine="openpyxl")
-                rb.seek(0)
+                rb = BytesIO(); result.to_excel(rb, index=False, engine="openpyxl"); rb.seek(0)
                 st.download_button(
                     label="📥 결과 데이터 다운로드 (Excel)",
                     data=rb,
@@ -1172,155 +865,41 @@ elif menu_val == "내고객 분석하기":
                 )
                 st.data_editor(result, use_container_width=True, key="customer_editor", height=520)
 
-                # ===== 첨부파일 매트릭스 =====
+                # ===== 첨부 링크 매트릭스 =====
                 st.markdown("---")
                 st.subheader("🔗 입찰공고명 기준으로 URL을 분류합니다.")
                 st.caption("(본공고링크/제안요청서/공고서/과업지시서/규격서/기타, URL 중복 제거)")
-                title_col_candidates = ["입찰공고명", "공고명"]
-                title_col = next((c for c in title_col_candidates if c in result.columns), None)
-                if not title_col:
-                    st.error("⚠️ '입찰공고명' 또는 '공고명' 컬럼을 찾을 수 없습니다.")
-                else:
+                title_col = next((c for c in ["입찰공고명", "공고명"] if c in result.columns), None)
+                if title_col:
                     attach_df = build_attachment_matrix(result, title_col)
-                    if attach_df.empty:
-                        st.info("분류할 수 있는 링크를 찾지 못했습니다.")
-                    else:
-                        use_compact = st.toggle("🔀 그룹형(Compact) 보기로 전환", value=True,
-                                                help="가로폭을 줄이고 읽기 좋게 카드형으로 표시")
+                    if not attach_df.empty:
+                        use_compact = st.toggle("🔀 그룹형(Compact) 보기", value=True)
                         if use_compact:
-                            html = render_attachment_cards_html(attach_df, title_col)
-                            st.markdown(html, unsafe_allow_html=True)
+                            st.markdown(render_attachment_cards_html(attach_df, title_col), unsafe_allow_html=True)
                         else:
                             st.dataframe(attach_df.applymap(lambda x: '' if pd.isna(x) else re.sub(r"<[^>]+>", "", str(x))))
 
-                        attach_df_text = attach_df.copy().applymap(
-                            lambda x: '' if pd.isna(x) else re.sub(r"<[^>]+>", "", str(x))
-                        )
-                        xbuf = BytesIO()
-                        with pd.ExcelWriter(xbuf, engine="openpyxl") as writer:
-                            attach_df_text.to_excel(writer, index=False, sheet_name="attachments")
-                        xbuf.seek(0)
-                        st.download_button(
-                            label="📥 첨부 링크 매트릭스 다운로드 (Excel, HTML 제거)",
-                            data=xbuf,
-                            file_name=f"{'_'.join(customers)}_첨부링크_매트릭스_{datetime.now().strftime('%Y%m%d')}.xlsx",
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        )
-
                 # ===== Gemini 분석 =====
                 st.markdown("---")
-                st.subheader("🤖 Gemini 분석 (업로드한 파일 자동 변환 포함)")
-                st.caption("HWP/HWPX/DOCX/PPTX/XLSX/PDF/TXT/CSV/MD/LOG 지원 — "
-                           "**1차: 로컬 HWP 텍스트 추출 → 간이PDF**, **2차: CloudConvert API 변환**")
+                st.subheader("🤖 Gemini 분석 (2단계 단순화)")
+                st.caption("1) Gemini 선 분석 가능한 파일(pdf/txt/csv/md/log) → 즉시 텍스트\n"
+                           "2) 나머지(hwp/hwpx/docx/pptx/xlsx 등) → CloudConvert PDF → 텍스트")
 
                 src_files = st.file_uploader(
                     "분석할 파일 업로드 (여러 개 가능)",
-                    type=["pdf", "hwp", "hwpx", "doc", "docx", "ppt", "pptx", "xls", "xlsx", "txt", "csv", "md", "log"],
+                    type=["pdf","hwp","hwpx","doc","docx","ppt","pptx","xls","xlsx","txt","csv","md","log"],
                     accept_multiple_files=True,
                     key="src_files_uploader",
                 )
 
-                # 기존 보고서 노출/다운로드
-                if st.session_state.get("gpt_report_md"):
-                    st.markdown("### 📝 Gemini 분석 보고서 (세션 보존)")
-                    st.markdown(st.session_state["gpt_report_md"])
-                    base_fname_prev = f"{'_'.join(customers) if customers else '세션'}_Gemini분석_{datetime.now().strftime('%Y%m%d_%H%M')}"
-                    md_bytes_prev = st.session_state["gpt_report_md"].encode("utf-8")
-                    col_md_prev, col_pdf_prev = st.columns(2)
-
-                    with col_md_prev:
-                        st.download_button(
-                            "📥 보고서 다운로드 (.md)",
-                            data=md_bytes_prev,
-                            file_name=f"{base_fname_prev}.md",
-                            mime="text/markdown",
-                            use_container_width=True,
-                        )
-
-                    with col_pdf_prev:
-                        pdf_bytes_prev, dbg_prev = markdown_to_pdf_korean(
-                            st.session_state["gpt_report_md"],
-                            title="Gemini 분석 보고서"
-                        )
-                        if pdf_bytes_prev:
-                            st.download_button(
-                                "📥 보고서 다운로드 (.pdf)",
-                                data=pdf_bytes_prev,
-                                file_name=f"{base_fname_prev}.pdf",
-                                mime="application/pdf",
-                                use_container_width=True,
-                            )
-                            st.caption(f"PDF 생성 상태: {dbg_prev}")
-                        else:
-                            st.error(f"PDF 생성 실패: {dbg_prev}")
-
-                    files = st.session_state.get("generated_src_pdfs") or []
-                    if files:
-                        st.markdown("### 🗂️ 변환된 간이 PDF 내려받기 (세션 보존)")
-                        for i, item in enumerate(files):
-                            try:
-                                if isinstance(item, tuple) and len(item) == 2:
-                                    fname, pbytes = item
-                                elif isinstance(item, dict):
-                                    fname, pbytes = item.get("name"), item.get("bytes")
-                                else:
-                                    continue
-                                if not pbytes:
-                                    continue
-                                st.download_button(
-                                    label=f"📥 {fname}",
-                                    data=pbytes,
-                                    file_name=f"{fname if str(fname).lower().endswith('.pdf') else (str(fname)+'.pdf')}",
-                                    mime="application/pdf",
-                                    key=f"dl_srcpdf_prev_{i}",
-                                    use_container_width=True,
-                                )
-                            except Exception:
-                                pass
-
-                # 새 보고서 생성
                 if st.button("🧠 Gemini 분석 보고서 생성", type="primary", use_container_width=True):
                     if not src_files:
                         st.warning("먼저 분석할 파일을 업로드하세요.")
                     else:
                         with st.spinner("Gemini가 업로드된 자료로 보고서를 작성 중..."):
-                            def extract_text_combo(uploaded_files):
-                                combined_texts, convert_logs, generated_pdfs = [], [], []
-                                for f in uploaded_files:
-                                    name = f.name
-                                    data = f.read()
-                                    ext = (os.path.splitext(name)[1] or "").lower()
+                            combined_text, logs, generated_pdfs = extract_text_combo_2step(src_files)
 
-                                    if ext in [".pdf", ".hwp", ".hwpx", ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx"]:
-                                        pdf_bytes, dbg = convert_any_to_pdf(data, name)
-                                        if pdf_bytes:
-                                            generated_pdfs.append((os.path.splitext(name)[0] + ".pdf", pdf_bytes))
-                                            txt = extract_text_from_pdf_bytes(pdf_bytes)
-                                            convert_logs.append(f"✅ {name} → PDF 변환 성공 ({dbg}), 텍스트 {len(txt)} chars")
-                                            combined_texts.append(f"\n\n===== [{name} → PDF] =====\n{_redact_secrets(txt)}\n")
-                                        else:
-                                            convert_logs.append(f"🛑 {name}: PDF 변환 실패 ({dbg})")
-
-                                    elif ext in [".txt", ".csv", ".md", ".log"]:
-                                        for enc in ("utf-8-sig", "utf-8", "cp949", "euc-kr"):
-                                            try:
-                                                txt = data.decode(enc)
-                                                break
-                                            except Exception:
-                                                continue
-                                        else:
-                                            txt = data.decode("utf-8", errors="ignore")
-                                        convert_logs.append(f"🗒️ {name}: 텍스트 로드 완료")
-                                        combined_texts.append(f"\n\n===== [{name}] =====\n{_redact_secrets(txt)}\n")
-
-                                    else:
-                                        convert_logs.append(f"ℹ️ {name}: 미지원 형식(원본 참조)")
-
-                                return "\n".join(combined_texts).strip(), convert_logs, generated_pdfs
-
-                            combined_text, logs, generated_pdfs = extract_text_combo(src_files)
-
-                            st.write("### 변환 로그")
+                            st.write("### 변환/추출 로그")
                             for line in logs:
                                 st.write("- " + line)
 
@@ -1335,10 +914,9 @@ elif menu_val == "내고객 분석하기":
 배정예산/추정가격/예가 등을 표와 불릿으로 요약하세요.
 추가 요구사항: {safe_extra}
 
-[문서 통합 텍스트 (일부만 사용해도 됨)]
+[문서 통합 텍스트]
 {combined_text[:180000]}
 """.strip()
-
                                 try:
                                     report = call_gemini(
                                         [
@@ -1357,81 +935,58 @@ elif menu_val == "내고객 분석하기":
                                     st.session_state["generated_src_pdfs"] = generated_pdfs
 
                                     base_fname = f"{'_'.join(customers)}_Gemini분석_{datetime.now().strftime('%Y%m%d_%H%M')}"
-                                    md_bytes = report.encode("utf-8")
+                                    st.download_button("📥 보고서 다운로드 (.md)", data=report.encode("utf-8"),
+                                                       file_name=f"{base_fname}.md", mime="text/markdown", use_container_width=True)
 
-                                    col_md, col_pdf = st.columns(2)
-                                    with col_md:
-                                        st.download_button(
-                                            "📥 보고서 다운로드 (.md)",
-                                            data=md_bytes,
-                                            file_name=f"{base_fname}.md",
-                                            mime="text/markdown",
-                                            use_container_width=True,
-                                        )
-                                    with col_pdf:
-                                        pdf_bytes, dbg = markdown_to_pdf_korean(report, title="Gemini 분석 보고서")
-                                        if pdf_bytes:
-                                            st.download_button(
-                                                "📥 보고서 다운로드 (.pdf)",
-                                                data=pdf_bytes,
-                                                file_name=f"{base_fname}.pdf",
-                                                mime="application/pdf",
-                                                use_container_width=True,
-                                            )
-                                            st.caption(f"PDF 생성 상태: {dbg}")
-                                        else:
-                                            st.error(f"PDF 생성 실패: {dbg}")
+                                    pdf_bytes, dbg = markdown_to_pdf_korean(report, title="Gemini 분석 보고서")
+                                    if pdf_bytes:
+                                        st.download_button("📥 보고서 다운로드 (.pdf)", data=pdf_bytes,
+                                                           file_name=f"{base_fname}.pdf", mime="application/pdf", use_container_width=True)
+                                        st.caption(f"PDF 생성 상태: {dbg}")
 
-                                    if st.session_state["generated_src_pdfs"]:
+                                    if generated_pdfs:
                                         st.markdown("---")
-                                        st.markdown("### 🗂️ 변환된 간이 PDF 내려받기")
-                                        for i, (fname, pbytes) in enumerate(st.session_state["generated_src_pdfs"]):
-                                            if not pbytes:
-                                                continue
+                                        st.markdown("### 🗂️ CloudConvert로 변환된 PDF 내려받기")
+                                        for i, (fname, pbytes) in enumerate(generated_pdfs):
                                             st.download_button(
                                                 label=f"📥 {fname}",
                                                 data=pbytes,
-                                                file_name=f"{fname if str(fname).lower().endswith('.pdf') else (str(fname)+'.pdf')}",
+                                                file_name=fname,
                                                 mime="application/pdf",
-                                                key=f"dl_srcpdf_immediate_{i}",
+                                                key=f"dl_ccpdf_{i}",
                                                 use_container_width=True,
                                             )
 
                                 except Exception as e:
                                     st.error(f"보고서 생성 중 오류: {e}")
 
-                # ===== (2차) 보고서+테이블 참조 챗봇 =====
+                # ===== 컨텍스트 챗봇 =====
                 st.markdown("---")
                 st.subheader("💬 보고서/테이블 참조 챗봇")
-                st.caption("아래 대화는 방금 생성된 **보고서(.md)**와 현재 **표(검색 결과)** 를 컨텍스트로 사용합니다.")
-
-                question = st.chat_input("질문을 입력하세요 (예: 핵심 리스크와 완화전략만 추려줘)")
+                question = st.chat_input("질문을 입력하세요")
                 if question:
                     st.session_state.setdefault("chat_messages", [])
                     st.session_state["chat_messages"].append({"role": "user", "content": question})
 
                     ctx_df = result.head(200).copy()
-                    with pd.option_context("display.max_columns", None):
-                        df_sample_csv = ctx_df.to_csv(index=False)[:20000]
-
+                    df_sample_csv = ctx_df.to_csv(index=False)[:20000]
                     report_ctx = st.session_state.get("gpt_report_md") or "(아직 보고서 없음)"
 
                     q_prompt = f"""
-다음은 컨텍스트입니다.
-[요약 보고서(Markdown)]
+[요약 보고서]
 {report_ctx}
 
-[표 데이터(일부 CSV)]
+[표 데이터 일부 CSV]
 {df_sample_csv}
 
-사용자 질문: {question}
-컨텍스트에 근거해 한국어로 간결하고 조리 있게 답하세요. 표/불릿을 활용하세요.
+질문: {question}
+컨텍스트에 근거해 한국어로 간결하게 답하세요. 표/불릿 적극 활용.
 """.strip()
 
                     try:
                         ans = call_gemini(
                             [
-                                {"role": "system", "content": "당신은 조달/통신 제안 분석 챗봇입니다. 컨텍스트만으로 답하고 모르면 모른다고 하세요."},
+                                {"role": "system", "content": "당신은 조달/통신 제안 분석 챗봇입니다. 컨텍스트 기반으로만 답하세요."},
                                 {"role": "user", "content": q_prompt},
                             ],
                             model="gemini-2.0-flash",
@@ -1443,26 +998,4 @@ elif menu_val == "내고객 분석하기":
                         st.session_state["chat_messages"].append({"role": "assistant", "content": f"오류: {e}"})
 
                 for m in st.session_state.get("chat_messages", []):
-                    if m["role"] == "user":
-                        st.chat_message("user").markdown(m["content"])
-                    else:
-                        st.chat_message("assistant").markdown(m["content"])
-
-
-# =============================
-# (참고) requirements.txt 권장 버전
-# ------------------------------
-# streamlit==1.39.0
-# pandas==2.2.3
-# numpy==1.26.4
-# openpyxl==3.1.5
-# XlsxWriter==3.2.0
-# plotly==5.24.1
-# PyPDF2==3.0.1
-# reportlab==4.2.5
-# Pillow==10.4.0
-# requests>=2.31.0
-# olefile==0.47
-# (선택) pyhwp==0.1.1  # 또는 hwp5txt CLI가 서버에 설치되어 있으면 사용 가능
-# Gemini: st.secrets에 GEMINI_API_KEY 필요 (requests로 호출하므로 별도 패키지 불필요)
-# CloudConvert: st.secrets에 CLOUDCONVERT_API_KEY 필요
+                    st.chat_message("user" if m["role"] == "user" else "assistant").markdown(m["content"])
