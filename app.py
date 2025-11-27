@@ -31,6 +31,10 @@ import pandas as pd
 import numpy as np
 import plotly.express as px
 
+# ✅ Markdown → HTML → PDF 용
+import markdown as md_lib
+from xhtml2pdf import pisa
+
 # ===== HWP/HWPX 로컬 추출용 =====
 import io
 import struct
@@ -504,7 +508,7 @@ def cloudconvert_convert_to_pdf(file_bytes: bytes, filename: str, timeout_sec: i
 
 
 # =============================
-# PDF 텍스트 추출 / Markdown→PDF(보고서용)
+# PDF 텍스트 추출
 # =============================
 try:
     from PyPDF2 import PdfReader
@@ -522,76 +526,99 @@ def extract_text_from_pdf_bytes(file_bytes: bytes) -> str:
         return f"[PDF 추출 실패] {e}"
 
 
-# ✅ 한글 폰트 우선 (로컬 TTF → 시스템 경로 → 폴백)
-def text_to_pdf_bytes_korean(text: str, title: str = ""):
+# =============================
+# ✅ Markdown → HTML → PDF (xhtml2pdf + NanumGothic)
+# =============================
+def markdown_to_pdf_korean(md_text: str, title: str | None = None):
+    """
+    마크다운 텍스트를 HTML로 변환 후 xhtml2pdf로 PDF 생성.
+    - #, ##, **, * 등 기본 Markdown 문법 시각 반영
+    - NanumGothic.ttf를 앱 디렉터리에서 로딩하여 한글 깨짐 방지
+    """
     try:
-        from reportlab.lib.pagesizes import A4
-        from reportlab.lib.units import mm
-        from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
-        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-        from reportlab.pdfbase import pdfmetrics
-        from reportlab.pdfbase.ttfonts import TTFont
-        from reportlab.lib.enums import TA_LEFT
-
-        # 1순위: 앱 디렉터리 내 NanumGothic.ttf
         base_dir = Path(__file__).resolve().parent
-        local_font = base_dir / "NanumGothic.ttf"
+        font_path = base_dir / "NanumGothic.ttf"
 
-        font_name = "NanumGothic"
-        font_path = None
-
-        if local_font.exists():
-            font_path = str(local_font)
-        elif os.path.exists("/usr/share/fonts/truetype/nanum/NanumGothic.ttf"):
-            font_path = "/usr/share/fonts/truetype/nanum/NanumGothic.ttf"
-
-        if font_path:
-            pdfmetrics.registerFont(TTFont(font_name, font_path))
-        else:
-            # ⚠️ 폰트를 못 찾으면 한글은 깨질 수 있음
-            font_name = "Helvetica"
-
-        styles = getSampleStyleSheet()
-        base = ParagraphStyle(
-            name="KBase",
-            parent=styles["Normal"],
-            fontName=font_name,
-            fontSize=10.5,
-            leading=14.5,
-            alignment=TA_LEFT,
-        )
-        h2 = ParagraphStyle(name="KH2", parent=base, fontSize=15, leading=19)
-
-        def esc(s: str) -> str:
-            return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
-        flow = []
+        # 제목이 있으면 Markdown 상단에 # 제목으로 붙여줌
         if title:
-            flow.append(Paragraph(esc(title), h2))
-            flow.append(Spacer(1, 8))
+            source_md = f"# {title}\n\n{md_text}"
+        else:
+            source_md = md_text
 
-        for para in (text or "").split("\n\n"):
-            flow.append(Paragraph(esc(para).replace("\n", "<br/>"), base))
-            flow.append(Spacer(1, 4))
+        # 1. Markdown → HTML
+        html_text = md_lib.markdown(source_md)
 
-        buf = BytesIO()
-        doc = SimpleDocTemplate(
-            buf,
-            pagesize=A4,
-            leftMargin=18 * mm,
-            rightMargin=18 * mm,
-            topMargin=18 * mm,
-            bottomMargin=18 * mm,
+        # 2. HTML 템플릿 + CSS (폰트 포함)
+        #   xhtml2pdf는 CSS 지원이 제한적이므로 너무 복잡한 스타일은 피함
+        html_content = f"""
+        <html>
+        <head>
+            <meta charset="utf-8" />
+            <style>
+                @font-face {{
+                    font-family: 'NanumGothic';
+                    src: url('{font_path.name}');
+                }}
+                body {{
+                    font-family: 'NanumGothic', sans-serif;
+                    font-size: 11pt;
+                    line-height: 1.5;
+                }}
+                h1, h2, h3, h4, h5, h6 {{
+                    color: #2E86C1;
+                    margin-top: 12px;
+                    margin-bottom: 6px;
+                }}
+                h1 {{ font-size: 18pt; }}
+                h2 {{ font-size: 16pt; }}
+                h3 {{ font-size: 14pt; }}
+                strong, b {{
+                    font-weight: bold;
+                    color: #000000;
+                }}
+                ul, ol {{
+                    margin-left: 18px;
+                }}
+                table {{
+                    width: 100%;
+                    border-collapse: collapse;
+                    margin-top: 8px;
+                    margin-bottom: 8px;
+                }}
+                th, td {{
+                    border: 1px solid #444444;
+                    padding: 4px;
+                    font-size: 10pt;
+                }}
+                th {{
+                    background-color: #f0f0f0;
+                }}
+                code {{
+                    font-family: 'NanumGothic', monospace;
+                    background-color: #f5f5f5;
+                    padding: 2px 3px;
+                }}
+            </style>
+        </head>
+        <body>
+            {html_text}
+        </body>
+        </html>
+        """
+
+        # 3. HTML → PDF (메모리 상에서 생성)
+        result = BytesIO()
+        pisa_status = pisa.CreatePDF(
+            src=html_content,
+            dest=result,
+            encoding='utf-8'
         )
-        doc.build(flow)
-        buf.seek(0)
-        return buf.read(), "OK[ReportLab]"
+
+        if pisa_status.err:
+            return None, f"xhtml2pdf 오류: {pisa_status.err}"
+        return result.getvalue(), "OK[xhtml2pdf]"
     except Exception as e:
         return None, f"PDF 생성 실패: {e}"
-
-
-def markdown_to_pdf_korean(md_text: str, title: str | None = None):
-    return text_to_pdf_bytes_korean(md_text, title or "")
 
 
 # =============================
@@ -1177,7 +1204,7 @@ elif menu_val == "내고객 분석하기":
     st.title("🧑‍💼 내고객 분석하기")
     st.info("ℹ️ 이 메뉴는 사이드바 필터와 무관하게 **전체 원본 데이터**를 대상으로 검색합니다.")
 
-    demand_col = None
+    demand_col = None    # 수요기관 컬럼 탐색
     for col in ["수요기관명", "수요기관", "기관명"]:
         if col in df_original.columns:
             demand_col = col
@@ -1256,7 +1283,7 @@ elif menu_val == "내고객 분석하기":
                         with st.spinner("Gemini가 업로드된 자료로 보고서를 작성 중..."):
                             combined_text, logs, generated_pdfs = extract_text_combo_gemini_first(src_files)
 
-                            # 변환 로그 세션에 저장 (화면에는 아래 공통 렌더에서 출력)
+                            # 변환 로그 세션에 저장
                             st.session_state["gpt_convert_logs"] = logs
 
                             if not combined_text.strip():
@@ -1284,7 +1311,7 @@ elif menu_val == "내고객 분석하기":
                                         temperature=0.4,
                                     )
 
-                                    # ✅ 결과를 세션에 저장 (화면 렌더/다운로드는 아래 공통 영역에서 수행)
+                                    # ✅ 결과를 세션에 저장
                                     st.session_state["gpt_report_md"] = report
                                     st.session_state["generated_src_pdfs"] = generated_pdfs
 
@@ -1318,7 +1345,7 @@ elif menu_val == "내고객 분석하기":
                         use_container_width=True
                     )
 
-                    # 📥 .pdf 다운로드
+                    # 📥 .pdf 다운로드 (Markdown → HTML → PDF)
                     pdf_bytes, dbg = markdown_to_pdf_korean(report_md, title="Gemini 분석 보고서")
                     if pdf_bytes:
                         st.download_button(
