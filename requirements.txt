@@ -9,3 +9,5 @@ reportlab==4.2.5
 Pillow==10.4.0
 requests>=2.31.0
 olefile==0.47
+markdown
+xhtml2pdf
