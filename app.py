@@ -24,6 +24,7 @@ from io import BytesIO
 from urllib.parse import urlparse, unquote
 from textwrap import dedent
 from datetime import datetime
+from pathlib import Path  # ✅ 로컬 폰트 탐색용
 
 import streamlit as st
 import pandas as pd
@@ -54,12 +55,14 @@ st.markdown(
 SERVICE_DEFAULT = ["전용회선", "전화", "인터넷"]
 HTML_TAG_RE = re.compile(r"<[^>]+>")
 
+
 # =============================
 # 세션 상태 초기화
 # =============================
 for k, v in {
     "gpt_report_md": None,
     "generated_src_pdfs": [],
+    "gpt_convert_logs": [],  # ✅ 변환로그 세션 저장
     "authed": False,
     "chat_messages": [],
     "GEMINI_API_KEY": None,
@@ -519,6 +522,7 @@ def extract_text_from_pdf_bytes(file_bytes: bytes) -> str:
         return f"[PDF 추출 실패] {e}"
 
 
+# ✅ 한글 폰트 우선 (로컬 TTF → 시스템 경로 → 폴백)
 def text_to_pdf_bytes_korean(text: str, title: str = ""):
     try:
         from reportlab.lib.pagesizes import A4
@@ -529,11 +533,22 @@ def text_to_pdf_bytes_korean(text: str, title: str = ""):
         from reportlab.pdfbase.ttfonts import TTFont
         from reportlab.lib.enums import TA_LEFT
 
+        # 1순위: 앱 디렉터리 내 NanumGothic.ttf
+        base_dir = Path(__file__).resolve().parent
+        local_font = base_dir / "NanumGothic.ttf"
+
         font_name = "NanumGothic"
-        font_path = "/usr/share/fonts/truetype/nanum/NanumGothic.ttf"
-        if os.path.exists(font_path):
+        font_path = None
+
+        if local_font.exists():
+            font_path = str(local_font)
+        elif os.path.exists("/usr/share/fonts/truetype/nanum/NanumGothic.ttf"):
+            font_path = "/usr/share/fonts/truetype/nanum/NanumGothic.ttf"
+
+        if font_path:
             pdfmetrics.registerFont(TTFont(font_name, font_path))
         else:
+            # ⚠️ 폰트를 못 찾으면 한글은 깨질 수 있음
             font_name = "Helvetica"
 
         styles = getSampleStyleSheet()
@@ -1146,7 +1161,8 @@ menu_val = st.session_state.get("menu")
 if menu_val == "조달입찰결과현황":
     st.title("📑 조달입찰결과현황")
     dl_buf = BytesIO()
-    df_filtered.to_excel(dl_buf, index=False, engine="openpyxl"); dl_buf.seek(0)
+    df_filtered.to_excel(dl_buf, index=False, engine="openpyxl")
+    dl_buf.seek(0)
     st.download_button(
         label="📥 필터링된 데이터 다운로드 (Excel)",
         data=dl_buf,
@@ -1164,9 +1180,11 @@ elif menu_val == "내고객 분석하기":
     demand_col = None
     for col in ["수요기관명", "수요기관", "기관명"]:
         if col in df_original.columns:
-            demand_col = col; break
+            demand_col = col
+            break
     if not demand_col:
-        st.error("⚠️ 수요기관 관련 컬럼을 찾을 수 없습니다."); st.stop()
+        st.error("⚠️ 수요기관 관련 컬럼을 찾을 수 없습니다.")
+        st.stop()
     st.success(f"✅ 검색 대상 컬럼: **{demand_col}**")
 
     customer_input = st.text_input(f"고객사명을 입력하세요 ({demand_col} 기준, 쉼표로 복수 입력 가능)", help="예) 조달청, 국방부")
@@ -1184,7 +1202,9 @@ elif menu_val == "내고객 분석하기":
             result = df_original[df_original[demand_col].isin(customers)]
             st.subheader(f"📊 검색 결과: {len(result)}건")
             if not result.empty:
-                rb = BytesIO(); result.to_excel(rb, index=False, engine="openpyxl"); rb.seek(0)
+                rb = BytesIO()
+                result.to_excel(rb, index=False, engine="openpyxl")
+                rb.seek(0)
                 st.download_button(
                     label="📥 결과 데이터 다운로드 (Excel)",
                     data=rb,
@@ -1205,7 +1225,11 @@ elif menu_val == "내고객 분석하기":
                         if use_compact:
                             st.markdown(render_attachment_cards_html(attach_df, title_col), unsafe_allow_html=True)
                         else:
-                            st.dataframe(attach_df.applymap(lambda x: '' if pd.isna(x) else re.sub(r"<[^>]+>", "", str(x))))
+                            st.dataframe(
+                                attach_df.applymap(
+                                    lambda x: '' if pd.isna(x) else re.sub(r"<[^>]+>", "", str(x))
+                                )
+                            )
 
                 # ===== Gemini 분석 =====
                 st.markdown("---")
@@ -1219,11 +1243,12 @@ elif menu_val == "내고객 분석하기":
 
                 src_files = st.file_uploader(
                     "분석할 파일 업로드 (여러 개 가능)",
-                    type=["pdf","hwp","hwpx","doc","docx","ppt","pptx","xls","xlsx","txt","csv","md","log"],
+                    type=["pdf", "hwp", "hwpx", "doc", "docx", "ppt", "pptx", "xls", "xlsx", "txt", "csv", "md", "log"],
                     accept_multiple_files=True,
                     key="src_files_uploader",
                 )
 
+                # ----- 1) 보고서 생성 버튼 (세션에만 저장) -----
                 if st.button("🧠 Gemini 분석 보고서 생성", type="primary", use_container_width=True):
                     if not src_files:
                         st.warning("먼저 분석할 파일을 업로드하세요.")
@@ -1231,9 +1256,8 @@ elif menu_val == "내고객 분석하기":
                         with st.spinner("Gemini가 업로드된 자료로 보고서를 작성 중..."):
                             combined_text, logs, generated_pdfs = extract_text_combo_gemini_first(src_files)
 
-                            st.write("### 변환/추출 로그")
-                            for line in logs:
-                                st.write("- " + line)
+                            # 변환 로그 세션에 저장 (화면에는 아래 공통 렌더에서 출력)
+                            st.session_state["gpt_convert_logs"] = logs
 
                             if not combined_text.strip():
                                 st.error("업로드된 파일에서 텍스트를 추출하지 못했습니다.")
@@ -1260,47 +1284,65 @@ elif menu_val == "내고객 분석하기":
                                         temperature=0.4,
                                     )
 
-                                    st.markdown("### 📝 Gemini 분석 보고서")
-                                    st.markdown(report)
-
+                                    # ✅ 결과를 세션에 저장 (화면 렌더/다운로드는 아래 공통 영역에서 수행)
                                     st.session_state["gpt_report_md"] = report
                                     st.session_state["generated_src_pdfs"] = generated_pdfs
 
-                                    base_fname = f"{'_'.join(customers)}_Gemini분석_{datetime.now().strftime('%Y%m%d_%H%M')}"
-                                    st.download_button(
-                                        "📥 보고서 다운로드 (.md)",
-                                        data=report.encode("utf-8"),
-                                        file_name=f"{base_fname}.md",
-                                        mime="text/markdown",
-                                        use_container_width=True
-                                    )
-
-                                    pdf_bytes, dbg = markdown_to_pdf_korean(report, title="Gemini 분석 보고서")
-                                    if pdf_bytes:
-                                        st.download_button(
-                                            "📥 보고서 다운로드 (.pdf)",
-                                            data=pdf_bytes,
-                                            file_name=f"{base_fname}.pdf",
-                                            mime="application/pdf",
-                                            use_container_width=True
-                                        )
-                                        st.caption(f"PDF 생성 상태: {dbg}")
-
-                                    if generated_pdfs:
-                                        st.markdown("---")
-                                        st.markdown("### 🗂️ CloudConvert로 변환된 PDF 내려받기")
-                                        for i, (fname, pbytes) in enumerate(generated_pdfs):
-                                            st.download_button(
-                                                label=f"📥 {fname}",
-                                                data=pbytes,
-                                                file_name=fname,
-                                                mime="application/pdf",
-                                                key=f"dl_ccpdf_{i}",
-                                                use_container_width=True,
-                                            )
+                                    st.success("보고서 생성이 완료되었습니다. 아래에서 확인 및 다운로드할 수 있습니다.")
 
                                 except Exception as e:
                                     st.error(f"보고서 생성 중 오류: {e}")
+
+                # ----- 2) 변환 로그 + 보고서 + 다운로드 공통 렌더링 -----
+                convert_logs_ss = st.session_state.get("gpt_convert_logs", [])
+                if convert_logs_ss:
+                    st.write("### 변환/추출 로그")
+                    for line in convert_logs_ss:
+                        st.write("- " + line)
+
+                report_md = st.session_state.get("gpt_report_md")
+                generated_pdfs = st.session_state.get("generated_src_pdfs", [])
+
+                if report_md:
+                    st.markdown("### 📝 Gemini 분석 보고서")
+                    st.markdown(report_md)
+
+                    base_fname = f"{'_'.join(customers)}_Gemini분석_{datetime.now().strftime('%Y%m%d_%H%M')}"
+
+                    # 📥 .md 다운로드
+                    st.download_button(
+                        "📥 보고서 다운로드 (.md)",
+                        data=report_md.encode("utf-8"),
+                        file_name=f"{base_fname}.md",
+                        mime="text/markdown",
+                        use_container_width=True
+                    )
+
+                    # 📥 .pdf 다운로드
+                    pdf_bytes, dbg = markdown_to_pdf_korean(report_md, title="Gemini 분석 보고서")
+                    if pdf_bytes:
+                        st.download_button(
+                            "📥 보고서 다운로드 (.pdf)",
+                            data=pdf_bytes,
+                            file_name=f"{base_fname}.pdf",
+                            mime="application/pdf",
+                            use_container_width=True
+                        )
+                        st.caption(f"PDF 생성 상태: {dbg}")
+
+                    # CloudConvert PDF들
+                    if generated_pdfs:
+                        st.markdown("---")
+                        st.markdown("### 🗂️ CloudConvert로 변환된 PDF 내려받기")
+                        for i, (fname, pbytes) in enumerate(generated_pdfs):
+                            st.download_button(
+                                label=f"📥 {fname}",
+                                data=pbytes,
+                                file_name=fname,
+                                mime="application/pdf",
+                                key=f"dl_ccpdf_{i}",
+                                use_container_width=True,
+                            )
 
                 # ===== 컨텍스트 챗봇 =====
                 st.markdown("---")
