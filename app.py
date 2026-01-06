@@ -1259,13 +1259,15 @@ elif menu_val == "내고객 분석하기":
                             )
 
                 # ===== Gemini 분석 =====
+                #"0) 모든 파일: Gemini가 파일 그대로 선추출 시도\n"
+                #"1) 실패 시 HWP/HWPX는 로컬 olefile/zip로 TXT 추출\n"
+                #"2) 실패 시 텍스트류/PDF 로컬 추출\n"
+                #"3) 나머지 바이너리: CloudConvert PDF → 로컬 텍스트"
+                
                 st.markdown("---")
-                st.subheader("🤖 Gemini 분석 (Gemini 선시도 → HWP로컬 → 로컬기본 → CloudConvert)")
+                st.subheader("🤖 AI (Gemini)기반 첨부파일 분석")
                 st.caption(
-                    "0) 모든 파일: Gemini가 파일 그대로 선추출 시도\n"
-                    "1) 실패 시 HWP/HWPX는 로컬 olefile/zip로 TXT 추출\n"
-                    "2) 실패 시 텍스트류/PDF 로컬 추출\n"
-                    "3) 나머지 바이너리: CloudConvert PDF → 로컬 텍스트"
+                    "텍스트 위주의 분석이 이루어지며, 표, 사진, 복잡한 도형 등은 분석되지 않을 수 있습니다."
                 )
 
                 src_files = st.file_uploader(
