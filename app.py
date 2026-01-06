@@ -1,18 +1,7 @@
 # -*- coding: utf-8 -*-
-# app.py — Streamlit Cloud 단일 파일 통합본 (Gemini 선시도 + HWP 로컬추출 + CloudConvert 폴백)
+# app.py — Streamlit Cloud 단일 파일 통합본 (Part 1)
 # - Secrets([[AUTH.users]], GEMINI_API_KEY, CLOUDCONVERT_API_KEY)
-# - 로그인(팝업 없음) + 관리자 백도어(emp=2855, dob=910518)
-# - 업로드 엑셀(filtered 시트) 로드/필터/차트/다운로드
-# - 첨부 링크 매트릭스 + Compact 카드 UI
-# - LLM 분석 파이프라인:
-#   0) 모든 파일형식 Gemini에 파일 그대로 선처리 시도
-#   1) 실패 시 HWP/HWPX는 olefile/zip 로컬 TXT 추출(중간단계)
-#   2) 실패 시 텍스트류/ PDF는 로컬 추출
-#   3) 나머지 바이너리 → CloudConvert → PDF → 로컬 텍스트
-# - ✅ 신규 전처리:
-#   * 엑셀 로드 직후 filtered 시트에 '서비스구분' 컬럼 생성/분류 후 맨 뒤 추가
-#   * **입찰공고명**만 보고 분류
-#   * 사이드바 '서비스구분' 다중선택 필터 (default: 전용회선/전화/인터넷)
+# - 429 Error (Too Many Requests) 방지용 Retry 로직 추가
 
 import os
 import re
@@ -20,6 +9,7 @@ import json
 import base64
 import mimetypes
 import requests
+import time  # ✅ 재시도 지연(sleep)을 위해 필수
 from io import BytesIO
 from urllib.parse import urlparse, unquote
 from textwrap import dedent
@@ -123,7 +113,7 @@ def _get_gemini_key_from_secrets() -> str | None:
 
 
 # =============================
-# Gemini API 래퍼
+# Gemini API 래퍼 (Retry 로직 적용)
 # =============================
 GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
 
@@ -166,6 +156,9 @@ def _gemini_messages_to_contents(messages):
 
 
 def call_gemini(messages, temperature=0.4, max_tokens=2000, model="gemini-2.0-flash"):
+    """
+    Gemini API 호출 함수 (Retry 로직 포함)
+    """
     key = _get_gemini_key()
     if not key:
         raise Exception("Gemini API 키 미설정 (st.secrets.GEMINI_API_KEY 또는 사이드바 입력)")
@@ -194,17 +187,33 @@ def call_gemini(messages, temperature=0.4, max_tokens=2000, model="gemini-2.0-fl
     url = f"{GEMINI_API_BASE}/{model}:generateContent"
     headers = {"Content-Type": "application/json", "X-goog-api-key": key}
 
-    try:
-        r = requests.post(url, headers=headers, data=json.dumps(payload), timeout=60)
-        r.raise_for_status()
-        data = r.json()
-    except Exception as e:
-        raise Exception(f"Gemini 호출 실패: {e}")
+    # ✅ Retry Logic: 429/503 에러 시 지수 백오프 대기
+    max_retries = 3
+    data = None
+    
+    for attempt in range(max_retries):
+        try:
+            r = requests.post(url, headers=headers, data=json.dumps(payload), timeout=60)
+            r.raise_for_status()
+            data = r.json()
+            break  # 성공 시 탈출
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code in [429, 503]:
+                if attempt < max_retries - 1:
+                    wait_time = 2 ** (attempt + 1)  # 2, 4, 8초 대기
+                    time.sleep(wait_time)
+                    continue
+            raise Exception(f"Gemini 호출 실패 (HTTP {e.response.status_code}): {e}")
+        except Exception as e:
+            raise Exception(f"Gemini 호출 중 예외 발생: {e}")
 
     try:
         candidates = data.get("candidates", [])
         if not candidates:
+            if data.get("promptFeedback"):
+                return f"[차단됨] 프롬프트 피드백: {data['promptFeedback']}"
             raise Exception(f"candidates 비어있음: {data}")
+            
         parts = candidates[0]["content"]["parts"]
         text = "\n".join([p.get("text", "") for p in parts]).strip()
         if text:
@@ -216,7 +225,7 @@ def call_gemini(messages, temperature=0.4, max_tokens=2000, model="gemini-2.0-fl
 
 
 # =============================
-# ✅ Gemini 파일(바이너리 포함) 직접 선추출 헬퍼
+# ✅ Gemini 파일(바이너리 포함) 직접 선추출 헬퍼 (Retry 포함)
 # =============================
 def guess_mime_type(filename: str) -> str:
     ext = (os.path.splitext(filename)[1] or "").lower()
@@ -248,6 +257,9 @@ def gemini_try_extract_text_from_file(
     max_tokens: int = 2048,
     model: str = "gemini-2.0-flash",
 ) -> str | None:
+    """
+    파일을 Gemini에 업로드해 텍스트 추출 시도 (Retry 포함)
+    """
     key = _get_gemini_key()
     if not key:
         return None
@@ -288,10 +300,26 @@ def gemini_try_extract_text_from_file(
     url = f"{GEMINI_API_BASE}/{model}:generateContent"
     headers = {"Content-Type": "application/json", "X-goog-api-key": key}
 
+    # ✅ Retry Logic
+    max_retries = 3
+    data = None
+    
+    for attempt in range(max_retries):
+        try:
+            r = requests.post(url, headers=headers, data=json.dumps(payload), timeout=60)
+            r.raise_for_status()
+            data = r.json()
+            break
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code in [429, 503]:
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** (attempt + 1))
+                    continue
+            return None # 재시도 실패 시 그냥 None 반환하여 폴백(로컬 추출)으로 유도
+        except Exception:
+            return None
+
     try:
-        r = requests.post(url, headers=headers, data=json.dumps(payload), timeout=60)
-        r.raise_for_status()
-        data = r.json()
         candidates = data.get("candidates", [])
         if not candidates:
             return None
@@ -530,26 +558,17 @@ def extract_text_from_pdf_bytes(file_bytes: bytes) -> str:
 # ✅ Markdown → HTML → PDF (xhtml2pdf + NanumGothic)
 # =============================
 def markdown_to_pdf_korean(md_text: str, title: str | None = None):
-    """
-    마크다운 텍스트를 HTML로 변환 후 xhtml2pdf로 PDF 생성.
-    - #, ##, **, * 등 기본 Markdown 문법 시각 반영
-    - NanumGothic.ttf를 앱 디렉터리에서 로딩하여 한글 깨짐 방지
-    """
     try:
         base_dir = Path(__file__).resolve().parent
         font_path = base_dir / "NanumGothic.ttf"
 
-        # 제목이 있으면 Markdown 상단에 # 제목으로 붙여줌
         if title:
             source_md = f"# {title}\n\n{md_text}"
         else:
             source_md = md_text
 
-        # 1. Markdown → HTML
         html_text = md_lib.markdown(source_md)
 
-        # 2. HTML 템플릿 + CSS (폰트 포함)
-        #   xhtml2pdf는 CSS 지원이 제한적이므로 너무 복잡한 스타일은 피함
         html_content = f"""
         <html>
         <head>
@@ -606,7 +625,6 @@ def markdown_to_pdf_korean(md_text: str, title: str | None = None):
         </html>
         """
 
-        # 3. HTML → PDF (메모리 상에서 생성)
         result = BytesIO()
         pisa_status = pisa.CreatePDF(
             src=html_content,
@@ -619,7 +637,6 @@ def markdown_to_pdf_korean(md_text: str, title: str | None = None):
         return result.getvalue(), "OK[xhtml2pdf]"
     except Exception as e:
         return None, f"PDF 생성 실패: {e}"
-
 
 # =============================
 # ✅ 서비스구분 컬럼 생성 (입찰공고명만 사용)
@@ -1122,7 +1139,10 @@ def extract_text_combo_gemini_first(uploaded_files):
         data = f.read()
         ext = (os.path.splitext(name)[1] or "").lower()
 
-        # 0) ✅ 모든 파일형식 Gemini 선추출 시도
+        # 0) ✅ 모든 파일형식 Gemini 선추출 시도 (Retry + 지연)
+        # 429 에러 방지를 위해 파일당 1초 지연
+        time.sleep(1.0)
+        
         gem_txt = gemini_try_extract_text_from_file(data, name)
         if gem_txt:
             convert_logs.append(f"🤖 {name}: Gemini 선 추출 성공 ({len(gem_txt)} chars)")
@@ -1259,15 +1279,13 @@ elif menu_val == "내고객 분석하기":
                             )
 
                 # ===== Gemini 분석 =====
-                #"0) 모든 파일: Gemini가 파일 그대로 선추출 시도\n"
-                #"1) 실패 시 HWP/HWPX는 로컬 olefile/zip로 TXT 추출\n"
-                #"2) 실패 시 텍스트류/PDF 로컬 추출\n"
-                #"3) 나머지 바이너리: CloudConvert PDF → 로컬 텍스트"
-                
                 st.markdown("---")
-                st.subheader("🤖 AI (Gemini)기반 첨부파일 분석")
+                st.subheader("🤖 Gemini 분석 (Gemini 선시도 → HWP로컬 → 로컬기본 → CloudConvert)")
                 st.caption(
-                    "텍스트 위주의 분석이 이루어지며, 표, 사진, 복잡한 도형 등은 분석되지 않을 수 있습니다."
+                    "0) 모든 파일: Gemini가 파일 그대로 선추출 시도\n"
+                    "1) 실패 시 HWP/HWPX는 로컬 olefile/zip로 TXT 추출\n"
+                    "2) 실패 시 텍스트류/PDF 로컬 추출\n"
+                    "3) 나머지 바이너리: CloudConvert PDF → 로컬 텍스트"
                 )
 
                 src_files = st.file_uploader(
@@ -1412,5 +1430,3 @@ elif menu_val == "내고객 분석하기":
 
                 for m in st.session_state.get("chat_messages", []):
                     st.chat_message("user" if m["role"] == "user" else "assistant").markdown(m["content"])
-
-# ========= EOF =========
