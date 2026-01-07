@@ -88,18 +88,37 @@ def _redact_secrets(text: str) -> str:
 # Secrets 헬퍼
 # =============================
 def _get_auth_users_from_secrets() -> list:
-    users = []
+    """
+    Secrets에서 사용자 정보를 안전하게 가져오는 함수 (수정됨)
+    """
     try:
-        auth = st.secrets.get("AUTH", {})
-        if isinstance(auth, dict):
-            users = auth.get("users", []) or []
-            users = [
-                u for u in users
-                if isinstance(u, dict) and u.get("emp") and u.get("dob")
-            ]
+        # 1. AUTH 섹션 가져오기 (없으면 빈 딕셔너리)
+        if "AUTH" not in st.secrets:
+            return []
+            
+        auth = st.secrets["AUTH"]
+        
+        # 2. users 키 접근 (딕셔너리처럼 동작하는지 확인 없이 바로 시도)
+        # Streamlit의 AttrDict는 .get()을 지원함
+        users = auth.get("users", [])
+        
+        # 3. 리스트가 아니면 빈 리스트 반환
+        if not isinstance(users, list):
+            return []
+            
+        # 4. 데이터 정제 (문자열 변환 보장)
+        valid_users = []
+        for u in users:
+            # emp와 dob가 있는지 확인 (키 존재 여부만 체크)
+            if "emp" in u and "dob" in u:
+                valid_users.append({
+                    "emp": str(u["emp"]).strip(),
+                    "dob": str(u["dob"]).strip()
+                })
+        return valid_users
+
     except Exception:
-        users = []
-    return users
+        return []
 
 
 def _get_gemini_key_from_secrets() -> str | None:
