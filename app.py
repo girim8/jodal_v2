@@ -1,8 +1,7 @@
 # -*- coding: utf-8 -*-
-# app.py — Streamlit Cloud 단일 파일 통합본 (Final Integrated + Enhanced Charts + Smart Filename)
+# app.py — Streamlit Cloud 단일 파일 통합본 (Final Robust Version)
 # - Features: Multi-Key Rotation, Sidebar Key Priority, Gemini 2.0 Fixed, Robust Auth
-# - Charts: Detailed Plotly analysis with Stacked Bars & Scatters
-# - Filename: Auto-generated from Report Title
+# - Fixes: Enhanced Error Handling for Charts, Smart Date Parsing, Auto Filename
 
 import os
 import re
@@ -16,7 +15,7 @@ from urllib.parse import urlparse, unquote
 from textwrap import dedent
 from datetime import datetime
 from pathlib import Path
-from math import isfinite  # ✅ 요청하신 import 추가
+from math import isfinite
 
 import streamlit as st
 import pandas as pd
@@ -62,8 +61,8 @@ for k, v in {
     "gpt_convert_logs": [],
     "authed": False,
     "chat_messages": [],
-    "GEMINI_API_KEY": None, # 기존 호환용
-    "user_input_gemini_key": "", # 사이드바 입력값 바인딩용
+    "GEMINI_API_KEY": None, 
+    "user_input_gemini_key": "",
     "role": None,
     "svc_filter_seed": ["전용회선", "전화", "인터넷"],
     "uploaded_file_obj": None,
@@ -92,9 +91,6 @@ def _redact_secrets(text: str) -> str:
 # Secrets 헬퍼 (Robust Auth)
 # =============================
 def _get_auth_users_from_secrets() -> list:
-    """
-    Secrets에서 사용자 정보를 안전하게 가져오는 함수
-    """
     try:
         if "AUTH" not in st.secrets:
             return []
@@ -129,12 +125,6 @@ def _get_gemini_key_from_secrets() -> str | None:
 # Gemini API 키 관리 (우선순위 + 로테이션)
 # =============================
 def _get_gemini_key_list() -> list[str]:
-    """
-    우선순위:
-    1. 사이드바 직접 입력 (st.session_state['user_input_gemini_key'])
-    2. Secrets (st.secrets['GEMINI_API_KEY'])
-    3. 환경변수 (os.environ['GEMINI_API_KEY'])
-    """
     sidebar_key = st.session_state.get("user_input_gemini_key", "").strip()
     if sidebar_key:
         raw_key = sidebar_key
@@ -177,9 +167,6 @@ def _gemini_messages_to_contents(messages):
 
 
 def call_gemini(messages, temperature=0.4, max_tokens=2000, model="gemini-2.0-flash-exp"):
-    """
-    Gemini API 호출 (키 로테이션 + 2.0 고정)
-    """
     key_list = _get_gemini_key_list()
     if not key_list:
         raise Exception("Gemini API 키가 설정되지 않았습니다.")
@@ -475,7 +462,7 @@ def _cloudconvert_supported() -> bool:
 def cloudconvert_convert_to_pdf(file_bytes: bytes, filename: str, timeout_sec: int = 180) -> tuple[bytes | None, str]:
     api_key = _get_cloudconvert_key()
     if not api_key:
-        return None, "CloudConvert 키 없음(st.secrets.CLOUDCONVERT_API_KEY)"
+        return None, "CloudConvert 키 없음"
 
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     job_payload = {
@@ -529,17 +516,17 @@ def cloudconvert_convert_to_pdf(file_bytes: bytes, filename: str, timeout_sec: i
             time.sleep(2)
 
     if not export_files:
-        return None, "CloudConvert 변환 대기 타임아웃/실패"
+        return None, "CloudConvert 변환 대기 타임아웃"
 
     try:
         url = export_files[0].get("url")
         if not url:
-            return None, "CloudConvert export URL 없음"
+            return None, "URL 없음"
         dr = requests.get(url, timeout=90)
         dr.raise_for_status()
         return dr.content, "OK[CloudConvert]"
     except Exception as e:
-        return None, f"CloudConvert 다운로드 실패: {e}"
+        return None, f"다운로드 실패: {e}"
 
 
 # =============================
@@ -884,16 +871,14 @@ def login_gate():
     col1, col2 = st.columns([1, 1])
     with col1:
         if st.button("로그인", type="primary", use_container_width=True):
-            # ✅ 중요: 입력값 앞뒤 공백 제거 (사용자 실수 방지)
             emp_clean = str(emp_input).strip()
             dob_clean = str(dob_input).strip()
             
             user_role = None
             
-            # 1. 관리자 확인 (하드코딩된 관리자)
+            # 1. 관리자 확인
             if emp_clean == "2855" and dob_clean == "910518":
                 user_role = "admin"
-                
             # 2. Secrets 사용자 확인
             else:
                 secret_users = _get_auth_users_from_secrets()
@@ -904,7 +889,6 @@ def login_gate():
                         user_role = "user"
                         break
 
-            # 3. 로그인 결과 처리
             if user_role:
                 st.session_state["authed"] = True
                 st.session_state["role"] = user_role
@@ -1004,7 +988,7 @@ if not st.session_state.get("authed", False):
 render_sidebar_base()
 
 # =============================
-# 업로드/데이터 로드
+# 업로드/데이터 로드 & 전처리 강화
 # =============================
 uploaded_file = st.session_state.get("uploaded_file_obj")
 if not uploaded_file:
@@ -1014,6 +998,26 @@ if not uploaded_file:
 
 try:
     df = pd.read_excel(uploaded_file, sheet_name="filtered", engine="openpyxl")
+    
+    # ✅ 안전장치: 공고게시일자_date 컬럼 자동 생성
+    # 1. 이미 존재하는 경우 -> datetime 변환
+    if "공고게시일자_date" in df.columns:
+        df["공고게시일자_date"] = pd.to_datetime(df["공고게시일자_date"], errors="coerce")
+    else:
+        # 2. 유사 컬럼 찾기 (공고게시일자, 게시일자, 일자 등)
+        date_candidates = ["공고게시일자", "게시일자", "일자", "등록일", "입력일시"]
+        found_col = None
+        for cand in date_candidates:
+            if cand in df.columns:
+                found_col = cand
+                break
+        
+        if found_col:
+            df["공고게시일자_date"] = pd.to_datetime(df[found_col], errors="coerce")
+        else:
+            # 3. 없으면 NaT로 채움 (차트에서 제외됨)
+            df["공고게시일자_date"] = pd.NaT
+
 except Exception as e:
     st.error(f"엑셀 로드 실패: {e}")
     st.stop()
@@ -1036,11 +1040,7 @@ selected_months = st.session_state.get("selected_months", [])
 demand_col_sidebar = "수요기관명" if "수요기관명" in df.columns else ("수요기관" if "수요기관" in df.columns else None)
 
 df_filtered = df.copy()
-if "공고게시일자_date" in df_filtered.columns:
-    df_filtered["공고게시일자_date"] = pd.to_datetime(df_filtered["공고게시일자_date"], errors="coerce")
-else:
-    df_filtered["공고게시일자_date"] = pd.NaT
-
+# (위에서 이미 처리했지만 필터링용 파생변수 생성)
 df_filtered["year"] = df_filtered["공고게시일자_date"].dt.year
 df_filtered["month"] = df_filtered["공고게시일자_date"].dt.month
 
@@ -1059,7 +1059,7 @@ if service_selected and "서비스구분" in df_filtered.columns:
 
 
 # =============================
-# 기본 분석(차트) - Updated Version
+# 기본 분석(차트) - Final Robust Version
 # =============================
 def render_basic_analysis_charts(base_df: pd.DataFrame):
     def pick_unit(max_val: float):
@@ -1087,218 +1087,259 @@ def render_basic_analysis_charts(base_df: pd.DataFrame):
     if "낙찰자선정여부" not in base_df.columns:
         st.warning("컬럼 '낙찰자선정여부'를 찾을 수 없습니다.")
         return
+    
+    # 낙찰 데이터만 필터링
     dwin = base_df[base_df["낙찰자선정여부"] == "Y"].copy()
     if dwin.empty:
         st.warning("낙찰(Y) 데이터가 없습니다.")
         return
 
+    # 숫자 컬럼 강제 변환 (에러 방지)
     for col in ["투찰금액", "배정예산금액", "투찰율"]:
         if col in dwin.columns:
             dwin[col] = pd.to_numeric(dwin[col], errors="coerce")
 
+    # 대표업체 표시용 컬럼 생성
     if "대표업체" in dwin.columns:
         dwin["대표업체_표시"] = dwin["대표업체"].map(normalize_vendor)
     else:
         dwin["대표업체_표시"] = "기타"
 
-    st.markdown("### 1) 대표업체별 분포")
-    unit_choice = st.selectbox("파이차트(투찰금액 합계) 표기 단위", ["자동", "원", "백만원", "억원", "조원"], index=0)
-    col_pie1, col_pie2 = st.columns(2)
+    # 1) 대표업체별 분포 (Pie Charts)
+    try:
+        st.markdown("### 1) 대표업체별 분포")
+        unit_choice = st.selectbox("파이차트(투찰금액 합계) 표기 단위", ["자동", "원", "백만원", "억원", "조원"], index=0)
+        col_pie1, col_pie2 = st.columns(2)
 
-    with col_pie1:
-        if "투찰금액" in dwin.columns:
-            sum_by_company = dwin.groupby("대표업체_표시")["투찰금액"].sum().reset_index().sort_values("투찰금액", ascending=False)
-            scaled_vals, unit_label = apply_unit(sum_by_company["투찰금액"].fillna(0), unit_choice)
-            sum_by_company["표시금액"] = scaled_vals
-            fig1 = px.pie(
-                sum_by_company,
+        with col_pie1:
+            if "투찰금액" in dwin.columns:
+                sum_by_company = dwin.groupby("대표업체_표시")["투찰금액"].sum().reset_index().sort_values("투찰금액", ascending=False)
+                scaled_vals, unit_label = apply_unit(sum_by_company["투찰금액"].fillna(0), unit_choice)
+                sum_by_company["표시금액"] = scaled_vals
+                fig1 = px.pie(
+                    sum_by_company,
+                    names="대표업체_표시",
+                    values="표시금액",
+                    title=f"대표업체별 투찰금액 합계 — 단위: {unit_label}",
+                    color="대표업체_표시",
+                    color_discrete_map=VENDOR_COLOR_MAP,
+                    color_discrete_sequence=OTHER_SEQ,
+                )
+                fig1.update_traces(
+                    hovertemplate="<b>%{label}</b><br>금액: %{value:,.2f} " + unit_label + "<br>비중: %{percent}",
+                    texttemplate="%{label}<br>%{value:,.2f} " + unit_label,
+                    textposition="auto",
+                )
+                st.plotly_chart(fig1, use_container_width=True)
+            else:
+                st.info("투찰금액 컬럼이 없어 파이차트(금액)를 생략합니다.")
+
+        with col_pie2:
+            cnt_by_company = dwin["대표업체_표시"].value_counts().reset_index()
+            cnt_by_company.columns = ["대표업체_표시", "건수"]
+            fig2 = px.pie(
+                cnt_by_company,
                 names="대표업체_표시",
-                values="표시금액",
-                title=f"대표업체별 투찰금액 합계 — 단위: {unit_label}",
+                values="건수",
+                title="대표업체별 낙찰 건수",
                 color="대표업체_표시",
                 color_discrete_map=VENDOR_COLOR_MAP,
                 color_discrete_sequence=OTHER_SEQ,
             )
-            fig1.update_traces(
-                hovertemplate="<b>%{label}</b><br>금액: %{value:,.2f} " + unit_label + "<br>비중: %{percent}",
-                texttemplate="%{label}<br>%{value:,.2f} " + unit_label,
+            fig2.update_traces(
+                hovertemplate="<b>%{label}</b><br>건수: %{value:,}건<br>비중: %{percent}",
+                texttemplate="%{label}<br>%{value:,}건",
                 textposition="auto",
             )
-            st.plotly_chart(fig1, use_container_width=True)
-        else:
-            st.info("투찰금액 컬럼이 없어 파이차트(금액)를 생략합니다.")
+            st.plotly_chart(fig2, use_container_width=True)
+    except Exception as e:
+        st.error(f"1번 차트 생성 중 오류 발생: {e}")
 
-    with col_pie2:
-        cnt_by_company = dwin["대표업체_표시"].value_counts().reset_index()
-        cnt_by_company.columns = ["대표업체_표시", "건수"]
-        fig2 = px.pie(
-            cnt_by_company,
-            names="대표업체_표시",
-            values="건수",
-            title="대표업체별 낙찰 건수",
-            color="대표업체_표시",
-            color_discrete_map=VENDOR_COLOR_MAP,
-            color_discrete_sequence=OTHER_SEQ,
-        )
-        fig2.update_traces(
-            hovertemplate="<b>%{label}</b><br>건수: %{value:,}건<br>비중: %{percent}",
-            texttemplate="%{label}<br>%{value:,}건",
-            textposition="auto",
-        )
-        st.plotly_chart(fig2, use_container_width=True)
-
-    st.markdown("### 2) 낙찰 특성 비율")
-    c1, c2 = st.columns(2)
-    with c1:
-        if "낙찰방법" in dwin.columns:
-            total = len(dwin)
-            suyi = (dwin["낙찰방법"] == "수의시담").sum()
-            st.metric(label="수의시담 비율", value=f"{(suyi / total * 100 if total else 0):.1f}%")
-        else:
-            st.info("낙찰방법 컬럼 없음")
-    with c2:
-        if "긴급공고" in dwin.columns:
-            total = len(dwin)
-            urgent = (dwin["긴급공고"] == "Y").sum()
-            st.metric(label="긴급공고 비율", value=f"{(urgent / total * 100 if total else 0):.1f}%")
-        else:
-            st.info("긴급공고 컬럼 없음")
-
-    st.markdown("### 3) 투찰율 산점도 & 4) 업체/년도별 수주금액")
-    col_scatter, col_bar3 = st.columns(2)
-    with col_scatter:
-        if "투찰율" in dwin.columns:
-            dwin["공고게시일자_date"] = pd.to_datetime(dwin.get("공고게시일자_date", pd.NaT), errors="coerce")
-            dplot = dwin.dropna(subset=["투찰율", "공고게시일자_date"]).copy()
-            dplot = dplot[dplot["투찰율"] <= 300]
-            hover_cols = [c for c in ["대표업체_표시", "수요기관명", "공고명", "입찰공고명", "입찰공고번호"] if c in dplot.columns]
-            fig_scatter = px.scatter(
-                dplot,
-                x="공고게시일자_date",
-                y="투찰율",
-                hover_data=hover_cols,
-                title="투찰율 산점도",
-                color="대표업체_표시",
-                color_discrete_map=VENDOR_COLOR_MAP,
-                color_discrete_sequence=OTHER_SEQ,
-            )
-            st.plotly_chart(fig_scatter, use_container_width=True)
-        else:
-            st.info("투찰율 컬럼 없음 - 산점도 생략")
-
-    with col_bar3:
-        if "투찰금액" in dwin.columns:
-            dyear = dwin.copy()
-            dyear["연도"] = pd.to_datetime(dyear.get("공고게시일자_date", pd.NaT), errors="coerce").dt.year
-            dyear = dyear.dropna(subset=["연도"]).astype({"연도": int})
-            by_vendor_year = dyear.groupby(["연도", "대표업체_표시"])["투찰금액"].sum().reset_index()
-            fig_vy = px.bar(
-                by_vendor_year,
-                x="연도",
-                y="투찰금액",
-                color="대표업체_표시",
-                barmode="group",
-                title="업체/년도별 수주금액",
-                color_discrete_map=VENDOR_COLOR_MAP,
-                color_discrete_sequence=OTHER_SEQ,
-            )
-            fig_vy.update_traces(hovertemplate="<b>%{x}년</b><br>%{legendgroup}: %{y:,.0f} 원")
-            st.plotly_chart(fig_vy, use_container_width=True)
-        else:
-            st.info("투찰금액 컬럼이 없어 '업체/년도별 수주금액'을 표시할 수 없습니다.")
-
-    st.markdown("### 5) 연·분기별 배정예산금액 — 누적 막대 & 총합")
-    col_stack, col_total = st.columns(2)
-    if "배정예산금액" not in dwin.columns:
-        with col_stack:
-            st.info("배정예산금액 컬럼 없음 - 막대그래프 생략")
-        return
-    dwin["공고게시일자_date"] = pd.to_datetime(dwin.get("공고게시일자_date", pd.NaT), errors="coerce")
-    g = dwin.dropna(subset=["공고게시일자_date"]).copy()
-    if g.empty:
-        with col_stack:
-            st.info("유효한 날짜가 없어 그래프 표시 불가")
-        return
-    g["연도"] = g["공고게시일자_date"].dt.year
-    g["분기"] = g["공고게시일자_date"].dt.quarter
-    g["연도분기"] = g["연도"].astype(str) + " Q" + g["분기"].astype(str)
-    if "대표업체_표시" not in g.columns:
-        g["대표업체_표시"] = g.get("대표업체", pd.Series([""] * len(g))).map(normalize_vendor)
-    title_col = "입찰공고명" if "입찰공고명" in g.columns else ("공고명" if "공고명" in g.columns else None)
-    group_col = "대표업체_표시"
-    if group_col not in g.columns:
-        with col_stack:
-            st.info("대표업체_표시 컬럼 없음")
-        return
-    with col_stack:
-        grp = g.groupby(["연도분기", group_col])["배정예산금액"].sum().reset_index(name="금액합")
-        if not grp.empty:
-            if title_col:
-                title_map = (
-                    g.groupby(["연도분기", group_col])[title_col]
-                    .apply(lambda s: " | ".join(pd.Series(s).dropna().astype(str).unique()[:10]))
-                    .rename("입찰공고목록")
-                    .reset_index()
-                )
-                grp = grp.merge(title_map, on=["연도분기", group_col], how="left")
-                grp["입찰공고목록"] = grp["입찰공고목록"].fillna("")
+    # 2) 낙찰 특성 비율 (Metrics)
+    try:
+        st.markdown("### 2) 낙찰 특성 비율")
+        c1, c2 = st.columns(2)
+        with c1:
+            if "낙찰방법" in dwin.columns:
+                total = len(dwin)
+                suyi = (dwin["낙찰방법"] == "수의시담").sum()
+                st.metric(label="수의시담 비율", value=f"{(suyi / total * 100 if total else 0):.1f}%")
             else:
-                grp["입찰공고목록"] = ""
-            grp["연"] = grp["연도분기"].str.extract(r"(\d{4})").astype(int)
-            grp["분"] = grp["연도분기"].str.extract(r"Q(\d)").astype(int)
-            grp = grp.sort_values(["연", "분", group_col]).reset_index(drop=True)
-            ordered_quarters = grp.sort_values(["연", "분"])["연도분기"].unique()
-            grp["연도분기"] = pd.Categorical(grp["연도분기"], categories=ordered_quarters, ordered=True)
-            import numpy as _np
-            custom = _np.column_stack([grp[group_col].astype(str).to_numpy(), grp["입찰공고목록"].astype(str).to_numpy()])
-            fig_stack = px.bar(
-                grp,
-                x="연도분기",
-                y="금액합",
-                color=group_col,
-                barmode="stack",
-                title=f"연·분기별 배정예산금액 — 누적(스택) / 그룹: {group_col}",
-                color_discrete_map=VENDOR_COLOR_MAP,
-                color_discrete_sequence=OTHER_SEQ,
-            )
-            fig_stack.update_traces(
-                customdata=custom,
-                hovertemplate=(
-                    "<b>%{x}</b><br>" +
-                    f"{group_col}: %{{customdata[0]}}<br>" +
-                    "금액: %{{y:,.0f}} 원<br>" +
-                    "입찰공고명: %{{customdata[1]}}"
-                ),
-            )
-            fig_stack.update_layout(xaxis_title="연도분기", yaxis_title="배정예산금액 (원)", margin=dict(l=10, r=10, t=60, b=10))
-            st.plotly_chart(fig_stack, use_container_width=True)
+                st.info("낙찰방법 컬럼 없음")
+        with c2:
+            if "긴급공고" in dwin.columns:
+                total = len(dwin)
+                urgent = (dwin["긴급공고"] == "Y").sum()
+                st.metric(label="긴급공고 비율", value=f"{(urgent / total * 100 if total else 0):.1f}%")
+            else:
+                st.info("긴급공고 컬럼 없음")
+    except Exception as e:
+        st.error(f"2번 지표 생성 중 오류 발생: {e}")
+
+    # 3) & 4) 산점도 및 막대그래프
+    try:
+        st.markdown("### 3) 투찰율 산점도 & 4) 업체/년도별 수주금액")
+        col_scatter, col_bar3 = st.columns(2)
+        
+        # 3) 산점도
+        with col_scatter:
+            if "투찰율" in dwin.columns:
+                # 날짜 변환 (에러 방지용으로 한번 더 수행)
+                dwin["공고게시일자_date"] = pd.to_datetime(dwin.get("공고게시일자_date", pd.NaT), errors="coerce")
+                dplot = dwin.dropna(subset=["투찰율", "공고게시일자_date"]).copy()
+                dplot = dplot[dplot["투찰율"] <= 300] # 이상치 제거
+                
+                hover_cols = [c for c in ["대표업체_표시", "수요기관명", "공고명", "입찰공고명", "입찰공고번호"] if c in dplot.columns]
+                
+                if not dplot.empty:
+                    fig_scatter = px.scatter(
+                        dplot,
+                        x="공고게시일자_date",
+                        y="투찰율",
+                        hover_data=hover_cols,
+                        title="투찰율 산점도",
+                        color="대표업체_표시",
+                        color_discrete_map=VENDOR_COLOR_MAP,
+                        color_discrete_sequence=OTHER_SEQ,
+                    )
+                    st.plotly_chart(fig_scatter, use_container_width=True)
+                else:
+                    st.info("유효한 데이터(날짜/투찰율)가 없어 산점도를 그릴 수 없습니다.")
+            else:
+                st.info("투찰율 컬럼 없음 - 산점도 생략")
+
+        # 4) 막대그래프
+        with col_bar3:
+            if "투찰금액" in dwin.columns:
+                dyear = dwin.copy()
+                dyear["연도"] = pd.to_datetime(dyear.get("공고게시일자_date", pd.NaT), errors="coerce").dt.year
+                dyear = dyear.dropna(subset=["연도"]).astype({"연도": int})
+                
+                if not dyear.empty:
+                    by_vendor_year = dyear.groupby(["연도", "대표업체_표시"])["투찰금액"].sum().reset_index()
+                    fig_vy = px.bar(
+                        by_vendor_year,
+                        x="연도",
+                        y="투찰금액",
+                        color="대표업체_표시",
+                        barmode="group",
+                        title="업체/년도별 수주금액",
+                        color_discrete_map=VENDOR_COLOR_MAP,
+                        color_discrete_sequence=OTHER_SEQ,
+                    )
+                    fig_vy.update_traces(hovertemplate="<b>%{x}년</b><br>%{legendgroup}: %{y:,.0f} 원")
+                    st.plotly_chart(fig_vy, use_container_width=True)
+                else:
+                    st.info("연도 정보가 없어 막대그래프를 그릴 수 없습니다.")
+            else:
+                st.info("투찰금액 컬럼이 없어 '업체/년도별 수주금액'을 표시할 수 없습니다.")
+    except Exception as e:
+        st.error(f"3, 4번 차트 생성 중 오류 발생: {e}")
+
+    # 5) 배정예산금액 누적 막대
+    try:
+        st.markdown("### 5) 연·분기별 배정예산금액 — 누적 막대 & 총합")
+        col_stack, col_total = st.columns(2)
+        
+        if "배정예산금액" not in dwin.columns:
+            st.info("배정예산금액 컬럼 없음 - 막대그래프 생략")
         else:
-            st.info("그룹핑 결과가 비어 있습니다.")
-    with col_total:
-        grp_total = g.groupby("연도분기")["배정예산금액"].sum().reset_index(name="금액합")
-        grp_total["연"] = grp_total["연도분기"].str.extract(r"(\d{4})").astype(int)
-        grp_total["분"] = grp_total["연도분기"].str.extract(r"Q(\d)").astype(int)
-        grp_total = grp_total.sort_values(["연", "분"])
-        if title_col:
-            titles_total = (
-                g.groupby("연도분기")[title_col]
-                .apply(lambda s: " | ".join(pd.Series(s).dropna().astype(str).unique()[:10]))
-                .reindex(grp_total["연도분기"]).fillna("")
-            )
-            import numpy as _np
-            custom2 = _np.stack([titles_total], axis=-1)
-        else:
-            import numpy as _np
-            custom2 = _np.stack([pd.Series([""] * len(grp_total))], axis=-1)
-        fig_bar = px.bar(grp_total, x="연도분기", y="금액합", title="연·분기별 배정예산금액 (총합)", text="금액합")
-        fig_bar.update_traces(
-            customdata=custom2,
-            hovertemplate="<b>%{x}</b><br>총액: %{y:,.0f} 원<br>입찰공고명: %{customdata[0]}",
-            texttemplate='%{text:,.0f}',
-            textposition='outside',
-            cliponaxis=False,
-        )
-        st.plotly_chart(fig_bar, use_container_width=True)
+            dwin["공고게시일자_date"] = pd.to_datetime(dwin.get("공고게시일자_date", pd.NaT), errors="coerce")
+            g = dwin.dropna(subset=["공고게시일자_date"]).copy()
+            
+            if g.empty:
+                st.info("유효한 날짜가 없어 그래프 표시 불가")
+            else:
+                g["연도"] = g["공고게시일자_date"].dt.year
+                g["분기"] = g["공고게시일자_date"].dt.quarter
+                g["연도분기"] = g["연도"].astype(str) + " Q" + g["분기"].astype(str)
+                
+                if "대표업체_표시" not in g.columns:
+                    g["대표업체_표시"] = g.get("대표업체", pd.Series([""] * len(g))).map(normalize_vendor)
+                
+                title_col = "입찰공고명" if "입찰공고명" in g.columns else ("공고명" if "공고명" in g.columns else None)
+                group_col = "대표업체_표시"
+
+                # 좌측 스택바
+                with col_stack:
+                    grp = g.groupby(["연도분기", group_col])["배정예산금액"].sum().reset_index(name="금액합")
+                    if not grp.empty:
+                        if title_col:
+                            title_map = (
+                                g.groupby(["연도분기", group_col])[title_col]
+                                .apply(lambda s: " | ".join(pd.Series(s).dropna().astype(str).unique()[:10]))
+                                .rename("입찰공고목록")
+                                .reset_index()
+                            )
+                            grp = grp.merge(title_map, on=["연도분기", group_col], how="left")
+                            grp["입찰공고목록"] = grp["입찰공고목록"].fillna("")
+                        else:
+                            grp["입찰공고목록"] = ""
+                            
+                        grp["연"] = grp["연도분기"].str.extract(r"(\d{4})").astype(int)
+                        grp["분"] = grp["연도분기"].str.extract(r"Q(\d)").astype(int)
+                        grp = grp.sort_values(["연", "분", group_col]).reset_index(drop=True)
+                        ordered_quarters = grp.sort_values(["연", "분"])["연도분기"].unique()
+                        grp["연도분기"] = pd.Categorical(grp["연도분기"], categories=ordered_quarters, ordered=True)
+                        
+                        import numpy as _np
+                        custom = _np.column_stack([grp[group_col].astype(str).to_numpy(), grp["입찰공고목록"].astype(str).to_numpy()])
+                        
+                        fig_stack = px.bar(
+                            grp,
+                            x="연도분기",
+                            y="금액합",
+                            color=group_col,
+                            barmode="stack",
+                            title=f"연·분기별 배정예산금액 — 누적(스택) / 그룹: {group_col}",
+                            color_discrete_map=VENDOR_COLOR_MAP,
+                            color_discrete_sequence=OTHER_SEQ,
+                        )
+                        fig_stack.update_traces(
+                            customdata=custom,
+                            hovertemplate=(
+                                "<b>%{x}</b><br>" +
+                                f"{group_col}: %{{customdata[0]}}<br>" +
+                                "금액: %{{y:,.0f}} 원<br>" +
+                                "입찰공고명: %{{customdata[1]}}"
+                            ),
+                        )
+                        fig_stack.update_layout(xaxis_title="연도분기", yaxis_title="배정예산금액 (원)", margin=dict(l=10, r=10, t=60, b=10))
+                        st.plotly_chart(fig_stack, use_container_width=True)
+                    else:
+                        st.info("그룹핑 결과가 비어 있습니다.")
+
+                # 우측 총합바
+                with col_total:
+                    grp_total = g.groupby("연도분기")["배정예산금액"].sum().reset_index(name="금액합")
+                    grp_total["연"] = grp_total["연도분기"].str.extract(r"(\d{4})").astype(int)
+                    grp_total["분"] = grp_total["연도분기"].str.extract(r"Q(\d)").astype(int)
+                    grp_total = grp_total.sort_values(["연", "분"])
+                    
+                    if title_col:
+                        titles_total = (
+                            g.groupby("연도분기")[title_col]
+                            .apply(lambda s: " | ".join(pd.Series(s).dropna().astype(str).unique()[:10]))
+                            .reindex(grp_total["연도분기"]).fillna("")
+                        )
+                        import numpy as _np
+                        custom2 = _np.stack([titles_total], axis=-1)
+                    else:
+                        import numpy as _np
+                        custom2 = _np.stack([pd.Series([""] * len(grp_total))], axis=-1)
+                    
+                    fig_bar = px.bar(grp_total, x="연도분기", y="금액합", title="연·분기별 배정예산금액 (총합)", text="금액합")
+                    fig_bar.update_traces(
+                        customdata=custom2,
+                        hovertemplate="<b>%{x}</b><br>총액: %{y:,.0f} 원<br>입찰공고명: %{customdata[0]}",
+                        texttemplate='%{text:,.0f}',
+                        textposition='outside',
+                        cliponaxis=False,
+                    )
+                    st.plotly_chart(fig_bar, use_container_width=True)
+
+    except Exception as e:
+        st.error(f"5번 차트 생성 중 오류 발생: {e}")
 
 
 # =============================
@@ -1620,6 +1661,3 @@ elif menu_val == "내고객 분석하기":
 
                 for m in st.session_state.get("chat_messages", []):
                     st.chat_message("user" if m["role"] == "user" else "assistant").markdown(m["content"])
-
-# == E O S == 
-
