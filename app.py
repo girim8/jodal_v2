@@ -874,32 +874,40 @@ def normalize_vendor(name: str) -> str:
 # =============================
 # 로그인 게이트 & 사이드바
 # =============================
-INFO_BOX = "사번/생년월일은 사내 배포용으로만 사용됩니다."
-
+INFO_BOX = "ID : 사번 네자리, PW :생년월일 네자리 (무단배포는 로그인 기록으로 추적가능합니다)"
 
 def login_gate():
     st.title("🔐 로그인")
     emp = st.text_input("사번", value="", placeholder="예: 9999")
     dob = st.text_input("생년월일(YYMMDD)", value="", placeholder="예: 990101", type="password")
-    users = _get_auth_users_from_secrets()
+    
+    # Secrets의 [AUTH] users 목록 가져오기
+    secret_users = _get_auth_users_from_secrets()
+    
     col1, col2 = st.columns([1, 1])
     with col1:
         if st.button("로그인", type="primary", use_container_width=True):
-            ok = False
+            user_role = None
+            
+            # 1. 관리자 확인 (기존 2855 계정은 코드상 관리자로 고정하거나, 원하시면 이것도 secrets로 뺄 수 있습니다)
             if emp == "2855" and dob == "910518":
-                ok = True
-                st.session_state["role"] = "admin"
-            elif any((str(u.get("emp")) == emp and str(u.get("dob")) == dob) for u in users):
-                ok = True
-                st.session_state["role"] = "user"
-            if ok:
+                user_role = "admin"
+                
+            # 2. Secrets에 등록된 사용자 확인
+            # (Streamlit Secrets에서 가져온 리스트와 대조)
+            elif any((str(u.get("emp")) == emp and str(u.get("dob")) == dob) for u in secret_users):
+                user_role = "user"
+
+            if user_role:
                 st.session_state["authed"] = True
-                st.success("로그인 성공")
+                st.session_state["role"] = user_role
+                st.success(f"로그인 성공 ({user_role})")
                 st.rerun()
             else:
                 st.error("인증 실패. 사번/생년월일을 확인하세요.")
     with col2:
         st.info(INFO_BOX)
+
 
 
 def render_sidebar_base():
