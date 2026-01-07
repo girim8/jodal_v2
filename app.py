@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
-# app.py — Streamlit Cloud 단일 파일 통합본 (Part 1)
-# - Secrets([[AUTH.users]], GEMINI_API_KEY, CLOUDCONVERT_API_KEY)
-# - 429 Error 방지: Smart Fallback (Gemini 2.0 -> 1.5) 및 자동 모델명 표시
+# app.py — Streamlit Cloud 단일 파일 통합본 (Final Integrated)
+# - Features: Multi-Key Rotation, Sidebar Key Priority, Gemini 2.0 Fixed, Robust Auth
+# - 429 Error 방지: Key Rotation (Sidebar -> Secrets -> Env)
 
 import os
 import re
@@ -48,6 +48,7 @@ st.markdown(
 
 SERVICE_DEFAULT = ["전용회선", "전화", "인터넷"]
 HTML_TAG_RE = re.compile(r"<[^>]+>")
+GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
 
 
 # =============================
@@ -59,7 +60,8 @@ for k, v in {
     "gpt_convert_logs": [],
     "authed": False,
     "chat_messages": [],
-    "GEMINI_API_KEY": None,
+    "GEMINI_API_KEY": None, # 기존 호환용 (사용 안함 권장)
+    "user_input_gemini_key": "", # 사이드바 입력값 바인딩용
     "role": None,
     "svc_filter_seed": ["전용회선", "전화", "인터넷"],
     "uploaded_file_obj": None,
@@ -85,21 +87,20 @@ def _redact_secrets(text: str) -> str:
 
 
 # =============================
-# Secrets 헬퍼
+# Secrets 헬퍼 (Robust Auth)
 # =============================
 def _get_auth_users_from_secrets() -> list:
     """
-    Secrets에서 사용자 정보를 안전하게 가져오는 함수 (수정됨)
+    Secrets에서 사용자 정보를 안전하게 가져오는 함수 (타입 체크 완화 버전)
     """
     try:
-        # 1. AUTH 섹션 가져오기 (없으면 빈 딕셔너리)
+        # 1. AUTH 섹션 가져오기
         if "AUTH" not in st.secrets:
             return []
             
         auth = st.secrets["AUTH"]
         
-        # 2. users 키 접근 (딕셔너리처럼 동작하는지 확인 없이 바로 시도)
-        # Streamlit의 AttrDict는 .get()을 지원함
+        # 2. users 키 접근 (딕셔너리처럼 동작하는지 확인 없이 시도)
         users = auth.get("users", [])
         
         # 3. 리스트가 아니면 빈 리스트 반환
@@ -109,8 +110,8 @@ def _get_auth_users_from_secrets() -> list:
         # 4. 데이터 정제 (문자열 변환 보장)
         valid_users = []
         for u in users:
-            # emp와 dob가 있는지 확인 (키 존재 여부만 체크)
-            if "emp" in u and "dob" in u:
+            # 딕셔너리 형태인지 확인하고 emp/dob 키가 있는지 체크
+            if isinstance(u, dict) and "emp" in u and "dob" in u:
                 valid_users.append({
                     "emp": str(u["emp"]).strip(),
                     "dob": str(u["dob"]).strip()
@@ -132,18 +133,35 @@ def _get_gemini_key_from_secrets() -> str | None:
 
 
 # =============================
-# Gemini API 래퍼 (Smart Fallback 적용)
+# Gemini API 키 관리 (우선순위 + 로테이션)
 # =============================
-GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
+def _get_gemini_key_list() -> list[str]:
+    """
+    우선순위:
+    1. 사이드바 직접 입력 (st.session_state['user_input_gemini_key'])
+    2. Secrets (st.secrets['GEMINI_API_KEY'])
+    3. 환경변수 (os.environ['GEMINI_API_KEY'])
+    
+    * 쉼표(,)로 구분된 다중 키를 리스트로 반환
+    """
+    # 1. 사이드바 입력 확인 (최우선)
+    sidebar_key = st.session_state.get("user_input_gemini_key", "").strip()
+    
+    if sidebar_key:
+        raw_key = sidebar_key
+    else:
+        # 2. Secrets 확인
+        raw_key = _get_gemini_key_from_secrets()
+        
+        # 3. 환경변수 확인
+        if not raw_key:
+            raw_key = os.environ.get("GEMINI_API_KEY", "")
 
+    if not raw_key:
+        return []
 
-def _get_gemini_key():
-    key = (
-        st.session_state.get("GEMINI_API_KEY")
-        or _get_gemini_key_from_secrets()
-        or os.environ.get("GEMINI_API_KEY")
-    )
-    return key.strip() if key else None
+    # 쉼표로 분리 및 공백 제거
+    return [k.strip() for k in str(raw_key).split(",") if k.strip()]
 
 
 def _gemini_messages_to_contents(messages):
@@ -176,11 +194,11 @@ def _gemini_messages_to_contents(messages):
 
 def call_gemini(messages, temperature=0.4, max_tokens=2000, model="gemini-2.0-flash-exp"):
     """
-    Gemini API 호출 (Gemini 2.0 전용, 단순화됨)
+    Gemini API 호출 (키 로테이션 + 2.0 고정)
     """
-    key = _get_gemini_key()
-    if not key:
-        raise Exception("Gemini API 키 미설정")
+    key_list = _get_gemini_key_list()
+    if not key_list:
+        raise Exception("Gemini API 키가 설정되지 않았습니다.")
 
     guardrail_system = {
         "role": "system",
@@ -195,43 +213,59 @@ def call_gemini(messages, temperature=0.4, max_tokens=2000, model="gemini-2.0-fl
     safe_messages = [guardrail_system] + messages
     contents = _gemini_messages_to_contents(safe_messages)
 
-    # ✅ 모델명 고정 (필요시 'gemini-2.0-flash' 등으로 변경 가능)
-    target_model = model 
-    url = f"{GEMINI_API_BASE}/{target_model}:generateContent"
-    headers = {"Content-Type": "application/json", "X-goog-api-key": key}
-    
-    payload = {
-        "contents": contents,
-        "generationConfig": {
-            "temperature": float(temperature),
-            "maxOutputTokens": int(max_tokens),
+    last_exception = None
+
+    # ✅ 키 리스트를 순회하며 시도 (Key Rotation)
+    for current_key in key_list:
+        url = f"{GEMINI_API_BASE}/{model}:generateContent"
+        headers = {"Content-Type": "application/json", "X-goog-api-key": current_key}
+        
+        payload = {
+            "contents": contents,
+            "generationConfig": {
+                "temperature": float(temperature),
+                "maxOutputTokens": int(max_tokens),
+            }
         }
-    }
 
-    try:
-        # 타임아웃만 넉넉히 설정
-        r = requests.post(url, headers=headers, data=json.dumps(payload), timeout=60)
-        r.raise_for_status()
-        data = r.json()
-        
-        candidates = data.get("candidates", [])
-        if not candidates:
-            if data.get("promptFeedback"):
-                return f"[차단됨] 피드백: {data['promptFeedback']}", target_model
-            raise Exception(f"응답 없음 (candidates Empty): {data}")
-        
-        parts = candidates[0]["content"]["parts"]
-        text = "\n".join([p.get("text", "") for p in parts]).strip()
-        
-        return text, target_model
+        try:
+            r = requests.post(url, headers=headers, data=json.dumps(payload), timeout=60)
+            r.raise_for_status()
+            data = r.json()
+            
+            candidates = data.get("candidates", [])
+            if not candidates:
+                if data.get("promptFeedback"):
+                    return f"[차단됨] 피드백: {data['promptFeedback']}", model
+                raise Exception(f"응답 없음 (candidates Empty): {data}")
+            
+            parts = candidates[0]["content"]["parts"]
+            text = "\n".join([p.get("text", "") for p in parts]).strip()
+            
+            # 성공 시 즉시 반환
+            return text, model
 
-    except Exception as e:
-        # 재시도 로직 없이 바로 에러 반환
-        raise Exception(f"Gemini({target_model}) 호출 실패: {e}")
+        except requests.exceptions.HTTPError as e:
+            code = e.response.status_code
+            last_exception = e
+            
+            # 429(과부하) 또는 403(키 만료/권한없음)인 경우 -> 다음 키 시도
+            if code in [429, 403]:
+                time.sleep(1) 
+                continue
+            
+            # 그 외 에러는 중단
+            break
+            
+        except Exception as e:
+            last_exception = e
+            break
+
+    raise Exception(f"모든 API 키({len(key_list)}개) 시도 실패. Last Error: {last_exception}")
 
 
 # =============================
-# ✅ Gemini 파일(바이너리 포함) 직접 선추출 헬퍼 (Fallback 포함)
+# ✅ Gemini 파일(바이너리 포함) 직접 선추출 헬퍼 (키 로테이션 적용)
 # =============================
 def guess_mime_type(filename: str) -> str:
     ext = (os.path.splitext(filename)[1] or "").lower()
@@ -264,10 +298,10 @@ def gemini_try_extract_text_from_file(
     model: str = "gemini-2.0-flash-exp",
 ) -> tuple[str | None, str | None]:
     """
-    파일 텍스트 추출 (Gemini 2.0 전용, 단순화됨)
+    파일 텍스트 추출 (Gemini 2.0 전용 + 키 로테이션)
     """
-    key = _get_gemini_key()
-    if not key:
+    key_list = _get_gemini_key_list()
+    if not key_list:
         return None, None
 
     mime_type = guess_mime_type(filename)
@@ -281,10 +315,6 @@ def gemini_try_extract_text_from_file(
     - 이미지/도면은 캡션 수준으로만 간단히 설명.
     - 추출 불가하면 'EXTRACTION_FAILED'라고만 답해.
     """).strip()
-
-    target_model = model
-    url = f"{GEMINI_API_BASE}/{target_model}:generateContent"
-    headers = {"Content-Type": "application/json", "X-goog-api-key": key}
 
     payload = {
         "contents": [{
@@ -305,26 +335,39 @@ def gemini_try_extract_text_from_file(
         }
     }
 
-    try:
-        r = requests.post(url, headers=headers, data=json.dumps(payload), timeout=60)
-        r.raise_for_status()
-        data = r.json()
-        
-        candidates = data.get("candidates", [])
-        if not candidates:
-            return None, None
-            
-        parts = candidates[0]["content"]["parts"]
-        text = "\n".join([p.get("text", "") for p in parts]).strip()
-        
-        if (not text) or ("EXTRACTION_FAILED" in text) or (len(text) < 30):
-            return None, None
-        
-        return _redact_secrets(text), target_model
+    # ✅ 키 리스트를 순회하며 시도
+    for current_key in key_list:
+        url = f"{GEMINI_API_BASE}/{model}:generateContent"
+        headers = {"Content-Type": "application/json", "X-goog-api-key": current_key}
 
-    except Exception:
-        # 실패 시 조용히 None 반환 (다음 로컬 추출 로직으로 넘어가기 위함)
-        return None, None
+        try:
+            r = requests.post(url, headers=headers, data=json.dumps(payload), timeout=60)
+            r.raise_for_status()
+            data = r.json()
+            
+            candidates = data.get("candidates", [])
+            if not candidates:
+                return None, None
+                
+            parts = candidates[0]["content"]["parts"]
+            text = "\n".join([p.get("text", "") for p in parts]).strip()
+            
+            if (not text) or ("EXTRACTION_FAILED" in text) or (len(text) < 30):
+                return None, None
+            
+            return _redact_secrets(text), model
+
+        except requests.exceptions.HTTPError as e:
+            # 429(과부하)면 다음 키 시도
+            if e.response.status_code == 429:
+                time.sleep(1)
+                continue
+            return None, None
+        except Exception:
+            return None, None
+
+    return None, None
+
 
 # =============================
 # ✅ HWP/HWPX 로컬 텍스트 추출
@@ -864,11 +907,11 @@ def login_gate():
     st.title("🔐 로그인")
     
     # 디버깅용: 현재 로드된 사용자 수 확인 (배포 후 잘 작동하면 주석 처리 가능)
-    secret_users = _get_auth_users_from_secrets()
+    # secret_users = _get_auth_users_from_secrets()
     # st.caption(f"시스템 상태: {len(secret_users)}명의 사용자 정보가 로드되었습니다.") 
 
-    emp_input = st.text_input("사번", value="", placeholder="예: 9999")
-    dob_input = st.text_input("생년월일(YYMMDD)", value="", placeholder="예: 990101", type="password")
+    emp_input = st.text_input("사번", value="", placeholder="예: 2855")
+    dob_input = st.text_input("생년월일(YYMMDD)", value="", placeholder="예: 910518", type="password")
     
     col1, col2 = st.columns([1, 1])
     with col1:
@@ -885,6 +928,7 @@ def login_gate():
                 
             # 2. Secrets 사용자 확인
             else:
+                secret_users = _get_auth_users_from_secrets()
                 for u in secret_users:
                     # ✅ 중요: 비교할 때 양쪽 다 문자열(str)로 변환하고 공백 제거하여 비교
                     u_emp = str(u.get("emp", "")).strip()
@@ -924,32 +968,36 @@ def render_sidebar_base():
 
     st.sidebar.radio("# 📋 메뉴 선택", ["조달입찰결과현황", "내고객 분석하기"], key="menu")
 
-    with st.sidebar.expander("🔑 Gemini API Key", expanded=True):
-        if _get_gemini_key_from_secrets():
-            st.success("Default Gemini 키를 불러왔습니다. (권장)")
-        key_in = st.text_input(
-            "사이드바에서 키 입력(선택) — st.secrets가 우선 적용됩니다.",
+    # ========================================================
+    # ✅ 수정됨: Gemini API Key 입력 (우선순위 & Key Rotation)
+    # ========================================================
+    st.sidebar.markdown("---")
+    with st.sidebar.expander("🔑 Gemini API Key 설정", expanded=True):
+        st.markdown("""
+        <small>콤마(,)로 구분하여 여러 개 입력 가능합니다.
+        (예: <code>Key1, Key2, ...</code>)<br>
+        입력값이 있으면 st.secrets보다 <b>우선 사용</b>됩니다.</small>
+        """, unsafe_allow_html=True)
+        
+        # 입력값을 session_state에 직접 바인딩
+        st.text_input(
+            "API Key 입력",
             type="password",
-            placeholder="AIza...."
+            key="user_input_gemini_key",
+            placeholder="AIzaSy..."
         )
-        if st.button("키 적용", use_container_width=True):
-            if key_in and key_in.strip().startswith("AIza"):
-                st.session_state["GEMINI_API_KEY"] = key_in.strip()
-                st.success("세션에 Gemini 키가 적용되었습니다.")
-            else:
-                st.warning("유효한 Gemini 키를 입력하세요 (AIza...).")
-
-    if _get_gemini_key():
-        st.sidebar.success("Gemini 사용 가능")
-    else:
-        st.sidebar.warning("Gemini 비활성 — st.secrets.GEMINI_API_KEY 설정 필요")
+        
+        # 현재 활성화된 키 개수 확인
+        current_keys = _get_gemini_key_list()
+        if current_keys:
+            st.sidebar.success(f"✅ Gemini 사용 가능 ({len(current_keys)}개 키 로드됨)")
+        else:
+            st.sidebar.warning("⚠️ Gemini 키가 없습니다.")
 
     if _cloudconvert_supported():
         st.sidebar.success("CloudConvert 사용 가능")
     else:
-        st.sidebar.warning("CloudConvert 비활성 — st.secrets.CLOUDCONVERT_API_KEY 설정 필요")
-    
-    # [삭제됨] Gemini 추가 요구사항 입력창 제거
+        st.sidebar.warning("CloudConvert 비활성 — st.secrets 필요")
 
 
 def render_sidebar_filters(df: pd.DataFrame):
@@ -1148,9 +1196,9 @@ def extract_text_combo_gemini_first(uploaded_files):
         data = f.read()
         ext = (os.path.splitext(name)[1] or "").lower()
 
-        # 무료 티어 429 방지용 지연
+        # 무료 티어 429 방지용 지연 (약간)
         if idx > 0:
-            time.sleep(2.0)
+            time.sleep(1.5)
         
         # ✅ 반환값 2개(텍스트, 모델) 받기
         gem_txt, used_model = gemini_try_extract_text_from_file(data, name)
@@ -1325,7 +1373,7 @@ elif menu_val == "내고객 분석하기":
                                             {"role": "system", "content": "당신은 SK브로드밴드 망설계/조달 제안 컨설턴트입니다."},
                                             {"role": "user", "content": prompt},
                                         ],
-                                        model="gemini-2.0-flash",
+                                        model="gemini-2.0-flash-exp",
                                         max_tokens=2000,
                                         temperature=0.4,
                                     )
@@ -1416,7 +1464,7 @@ elif menu_val == "내고객 분석하기":
                                 {"role": "system", "content": "당신은 조달/통신 제안 분석 챗봇입니다. 컨텍스트 기반으로만 답하세요."},
                                 {"role": "user", "content": q_prompt},
                             ],
-                            model="gemini-2.0-flash",
+                            model="gemini-2.0-flash-exp",
                             max_tokens=1200,
                             temperature=0.2,
                         )
@@ -1428,5 +1476,3 @@ elif menu_val == "내고객 분석하기":
 
                 for m in st.session_state.get("chat_messages", []):
                     st.chat_message("user" if m["role"] == "user" else "assistant").markdown(m["content"])
-
-# === EOF ===
