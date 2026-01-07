@@ -878,33 +878,50 @@ INFO_BOX = "ID : 사번 네자리, PW :생년월일 네자리 (무단배포는 �
 
 def login_gate():
     st.title("🔐 로그인")
-    emp = st.text_input("사번", value="", placeholder="예: 9999")
-    dob = st.text_input("생년월일(YYMMDD)", value="", placeholder="예: 990101", type="password")
     
-    # Secrets의 [AUTH] users 목록 가져오기
+    # 디버깅용: 현재 로드된 사용자 수 확인 (배포 후 잘 작동하면 주석 처리 가능)
     secret_users = _get_auth_users_from_secrets()
+    # st.caption(f"시스템 상태: {len(secret_users)}명의 사용자 정보가 로드되었습니다.") 
+
+    emp_input = st.text_input("사번", value="", placeholder="예: 9999")
+    dob_input = st.text_input("생년월일(YYMMDD)", value="", placeholder="예: 990101", type="password")
     
     col1, col2 = st.columns([1, 1])
     with col1:
         if st.button("로그인", type="primary", use_container_width=True):
+            # ✅ 중요: 입력값 앞뒤 공백 제거 (사용자 실수 방지)
+            emp_clean = str(emp_input).strip()
+            dob_clean = str(dob_input).strip()
+            
             user_role = None
             
-            # 1. 관리자 확인 (기존 2855 계정은 코드상 관리자로 고정하거나, 원하시면 이것도 secrets로 뺄 수 있습니다)
-            if emp == "2855" and dob == "910518":
+            # 1. 관리자 확인 (하드코딩된 관리자)
+            if emp_clean == "2855" and dob_clean == "910518":
                 user_role = "admin"
                 
-            # 2. Secrets에 등록된 사용자 확인
-            # (Streamlit Secrets에서 가져온 리스트와 대조)
-            elif any((str(u.get("emp")) == emp and str(u.get("dob")) == dob) for u in secret_users):
-                user_role = "user"
+            # 2. Secrets 사용자 확인
+            else:
+                for u in secret_users:
+                    # ✅ 중요: 비교할 때 양쪽 다 문자열(str)로 변환하고 공백 제거하여 비교
+                    u_emp = str(u.get("emp", "")).strip()
+                    u_dob = str(u.get("dob", "")).strip()
+                    
+                    if u_emp == emp_clean and u_dob == dob_clean:
+                        user_role = "user"
+                        break
 
+            # 3. 로그인 결과 처리
             if user_role:
                 st.session_state["authed"] = True
                 st.session_state["role"] = user_role
-                st.success(f"로그인 성공 ({user_role})")
-                st.rerun()
+                st.success(f"로그인 성공! ({user_role})")
+                time.sleep(0.5) # 로그인 성공 메시지 살짝 보여주고
+                st.rerun()      # 새로고침
             else:
-                st.error("인증 실패. 사번/생년월일을 확인하세요.")
+                st.error("인증 실패. 사번과 생년월일을 확인하세요.")
+                # 디버깅: 왜 실패했는지 힌트 (보안상 실제 운영 시에는 제거 권장)
+                # st.write(f"입력값: [{emp_clean}] / [{dob_clean}]")
+                
     with col2:
         st.info(INFO_BOX)
 
@@ -925,7 +942,7 @@ def render_sidebar_base():
 
     with st.sidebar.expander("🔑 Gemini API Key", expanded=True):
         if _get_gemini_key_from_secrets():
-            st.success("st.secrets에서 Gemini 키를 불러왔습니다. (권장)")
+            st.success("Default Gemini 키를 불러왔습니다. (권장)")
         key_in = st.text_input(
             "사이드바에서 키 입력(선택) — st.secrets가 우선 적용됩니다.",
             type="password",
