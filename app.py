@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
-# app.py — Streamlit Cloud 단일 파일 통합본 (Final Integrated)
+# app.py — Streamlit Cloud 단일 파일 통합본 (Final Integrated + Enhanced Charts + Smart Filename)
 # - Features: Multi-Key Rotation, Sidebar Key Priority, Gemini 2.0 Fixed, Robust Auth
-# - 429 Error 방지: Key Rotation (Sidebar -> Secrets -> Env)
+# - Charts: Detailed Plotly analysis with Stacked Bars & Scatters
+# - Filename: Auto-generated from Report Title
 
 import os
 import re
@@ -15,6 +16,7 @@ from urllib.parse import urlparse, unquote
 from textwrap import dedent
 from datetime import datetime
 from pathlib import Path
+from math import isfinite  # ✅ 요청하신 import 추가
 
 import streamlit as st
 import pandas as pd
@@ -60,7 +62,7 @@ for k, v in {
     "gpt_convert_logs": [],
     "authed": False,
     "chat_messages": [],
-    "GEMINI_API_KEY": None, # 기존 호환용 (사용 안함 권장)
+    "GEMINI_API_KEY": None, # 기존 호환용
     "user_input_gemini_key": "", # 사이드바 입력값 바인딩용
     "role": None,
     "svc_filter_seed": ["전용회선", "전화", "인터넷"],
@@ -91,33 +93,24 @@ def _redact_secrets(text: str) -> str:
 # =============================
 def _get_auth_users_from_secrets() -> list:
     """
-    Secrets에서 사용자 정보를 안전하게 가져오는 함수 (타입 체크 완화 버전)
+    Secrets에서 사용자 정보를 안전하게 가져오는 함수
     """
     try:
-        # 1. AUTH 섹션 가져오기
         if "AUTH" not in st.secrets:
             return []
-            
         auth = st.secrets["AUTH"]
-        
-        # 2. users 키 접근 (딕셔너리처럼 동작하는지 확인 없이 시도)
         users = auth.get("users", [])
-        
-        # 3. 리스트가 아니면 빈 리스트 반환
         if not isinstance(users, list):
             return []
-            
-        # 4. 데이터 정제 (문자열 변환 보장)
+        
         valid_users = []
         for u in users:
-            # 딕셔너리 형태인지 확인하고 emp/dob 키가 있는지 체크
             if isinstance(u, dict) and "emp" in u and "dob" in u:
                 valid_users.append({
                     "emp": str(u["emp"]).strip(),
                     "dob": str(u["dob"]).strip()
                 })
         return valid_users
-
     except Exception:
         return []
 
@@ -141,26 +134,18 @@ def _get_gemini_key_list() -> list[str]:
     1. 사이드바 직접 입력 (st.session_state['user_input_gemini_key'])
     2. Secrets (st.secrets['GEMINI_API_KEY'])
     3. 환경변수 (os.environ['GEMINI_API_KEY'])
-    
-    * 쉼표(,)로 구분된 다중 키를 리스트로 반환
     """
-    # 1. 사이드바 입력 확인 (최우선)
     sidebar_key = st.session_state.get("user_input_gemini_key", "").strip()
-    
     if sidebar_key:
         raw_key = sidebar_key
     else:
-        # 2. Secrets 확인
         raw_key = _get_gemini_key_from_secrets()
-        
-        # 3. 환경변수 확인
         if not raw_key:
             raw_key = os.environ.get("GEMINI_API_KEY", "")
 
     if not raw_key:
         return []
 
-    # 쉼표로 분리 및 공백 제거
     return [k.strip() for k in str(raw_key).split(",") if k.strip()]
 
 
@@ -176,7 +161,6 @@ def _gemini_messages_to_contents(messages):
     for m in user_assist:
         role = m.get("role", "user")
         txt = _redact_secrets(m.get("content", ""))
-
         gem_role = "user" if role == "user" else "model"
 
         if not contents and gem_role == "user" and sys_prefix:
@@ -215,7 +199,6 @@ def call_gemini(messages, temperature=0.4, max_tokens=2000, model="gemini-2.0-fl
 
     last_exception = None
 
-    # ✅ 키 리스트를 순회하며 시도 (Key Rotation)
     for current_key in key_list:
         url = f"{GEMINI_API_BASE}/{model}:generateContent"
         headers = {"Content-Type": "application/json", "X-goog-api-key": current_key}
@@ -241,22 +224,15 @@ def call_gemini(messages, temperature=0.4, max_tokens=2000, model="gemini-2.0-fl
             
             parts = candidates[0]["content"]["parts"]
             text = "\n".join([p.get("text", "") for p in parts]).strip()
-            
-            # 성공 시 즉시 반환
             return text, model
 
         except requests.exceptions.HTTPError as e:
             code = e.response.status_code
             last_exception = e
-            
-            # 429(과부하) 또는 403(키 만료/권한없음)인 경우 -> 다음 키 시도
             if code in [429, 403]:
                 time.sleep(1) 
                 continue
-            
-            # 그 외 에러는 중단
             break
-            
         except Exception as e:
             last_exception = e
             break
@@ -265,7 +241,7 @@ def call_gemini(messages, temperature=0.4, max_tokens=2000, model="gemini-2.0-fl
 
 
 # =============================
-# ✅ Gemini 파일(바이너리 포함) 직접 선추출 헬퍼 (키 로테이션 적용)
+# ✅ Gemini 파일(바이너리 포함) 직접 선추출 헬퍼
 # =============================
 def guess_mime_type(filename: str) -> str:
     ext = (os.path.splitext(filename)[1] or "").lower()
@@ -297,15 +273,13 @@ def gemini_try_extract_text_from_file(
     max_tokens: int = 2048,
     model: str = "gemini-2.0-flash-exp",
 ) -> tuple[str | None, str | None]:
-    """
-    파일 텍스트 추출 (Gemini 2.0 전용 + 키 로테이션)
-    """
+    
     key_list = _get_gemini_key_list()
     if not key_list:
         return None, None
 
     mime_type = guess_mime_type(filename)
-    if len(file_bytes) > 15 * 1024 * 1024: # 15MB 제한
+    if len(file_bytes) > 15 * 1024 * 1024:
         return None, None
 
     prompt = dedent(f"""
@@ -335,7 +309,6 @@ def gemini_try_extract_text_from_file(
         }
     }
 
-    # ✅ 키 리스트를 순회하며 시도
     for current_key in key_list:
         url = f"{GEMINI_API_BASE}/{model}:generateContent"
         headers = {"Content-Type": "application/json", "X-goog-api-key": current_key}
@@ -358,7 +331,6 @@ def gemini_try_extract_text_from_file(
             return _redact_secrets(text), model
 
         except requests.exceptions.HTTPError as e:
-            # 429(과부하)면 다음 키 시도
             if e.response.status_code == 429:
                 time.sleep(1)
                 continue
@@ -906,10 +878,6 @@ INFO_BOX = "ID : 사번 네자리, PW :생년월일 네자리 (무단배포는 �
 def login_gate():
     st.title("🔐 로그인")
     
-    # 디버깅용: 현재 로드된 사용자 수 확인 (배포 후 잘 작동하면 주석 처리 가능)
-    # secret_users = _get_auth_users_from_secrets()
-    # st.caption(f"시스템 상태: {len(secret_users)}명의 사용자 정보가 로드되었습니다.") 
-
     emp_input = st.text_input("사번", value="", placeholder="예: 2855")
     dob_input = st.text_input("생년월일(YYMMDD)", value="", placeholder="예: 910518", type="password")
     
@@ -930,10 +898,8 @@ def login_gate():
             else:
                 secret_users = _get_auth_users_from_secrets()
                 for u in secret_users:
-                    # ✅ 중요: 비교할 때 양쪽 다 문자열(str)로 변환하고 공백 제거하여 비교
                     u_emp = str(u.get("emp", "")).strip()
                     u_dob = str(u.get("dob", "")).strip()
-                    
                     if u_emp == emp_clean and u_dob == dob_clean:
                         user_role = "user"
                         break
@@ -943,16 +909,13 @@ def login_gate():
                 st.session_state["authed"] = True
                 st.session_state["role"] = user_role
                 st.success(f"로그인 성공! ({user_role})")
-                time.sleep(0.5) # 로그인 성공 메시지 살짝 보여주고
-                st.rerun()      # 새로고침
+                time.sleep(0.5)
+                st.rerun()
             else:
                 st.error("인증 실패. 사번과 생년월일을 확인하세요.")
-                # 디버깅: 왜 실패했는지 힌트 (보안상 실제 운영 시에는 제거 권장)
-                # st.write(f"입력값: [{emp_clean}] / [{dob_clean}]")
                 
     with col2:
         st.info(INFO_BOX)
-
 
 
 def render_sidebar_base():
@@ -968,18 +931,12 @@ def render_sidebar_base():
 
     st.sidebar.radio("# 📋 메뉴 선택", ["조달입찰결과현황", "내고객 분석하기"], key="menu")
 
-    # ========================================================
-    # ✅ 수정됨: Gemini API Key 입력 (우선순위 & Key Rotation)
-    # ========================================================
     st.sidebar.markdown("---")
     with st.sidebar.expander("🔑 Gemini API Key 설정", expanded=True):
         st.markdown("""
-        <small>콤마(,)로 구분하여 여러 개 입력 가능합니다.
-        (예: <code>Key1, Key2, ...</code>)<br>
-        입력값이 있으면 st.secrets보다 <b>우선 사용</b>됩니다.</small>
+        <small>입력값이 있으면 st.secrets보다 <b>우선 사용</b>됩니다.</small>
         """, unsafe_allow_html=True)
         
-        # 입력값을 session_state에 직접 바인딩
         st.text_input(
             "API Key 입력",
             type="password",
@@ -987,7 +944,6 @@ def render_sidebar_base():
             placeholder="AIzaSy..."
         )
         
-        # 현재 활성화된 키 개수 확인
         current_keys = _get_gemini_key_list()
         if current_keys:
             st.sidebar.success(f"✅ Gemini 사용 가능 ({len(current_keys)}개 키 로드됨)")
@@ -1103,7 +1059,7 @@ if service_selected and "서비스구분" in df_filtered.columns:
 
 
 # =============================
-# 기본 분석(차트)
+# 기본 분석(차트) - Updated Version
 # =============================
 def render_basic_analysis_charts(base_df: pd.DataFrame):
     def pick_unit(max_val: float):
@@ -1163,7 +1119,14 @@ def render_basic_analysis_charts(base_df: pd.DataFrame):
                 color_discrete_map=VENDOR_COLOR_MAP,
                 color_discrete_sequence=OTHER_SEQ,
             )
+            fig1.update_traces(
+                hovertemplate="<b>%{label}</b><br>금액: %{value:,.2f} " + unit_label + "<br>비중: %{percent}",
+                texttemplate="%{label}<br>%{value:,.2f} " + unit_label,
+                textposition="auto",
+            )
             st.plotly_chart(fig1, use_container_width=True)
+        else:
+            st.info("투찰금액 컬럼이 없어 파이차트(금액)를 생략합니다.")
 
     with col_pie2:
         cnt_by_company = dwin["대표업체_표시"].value_counts().reset_index()
@@ -1177,7 +1140,165 @@ def render_basic_analysis_charts(base_df: pd.DataFrame):
             color_discrete_map=VENDOR_COLOR_MAP,
             color_discrete_sequence=OTHER_SEQ,
         )
+        fig2.update_traces(
+            hovertemplate="<b>%{label}</b><br>건수: %{value:,}건<br>비중: %{percent}",
+            texttemplate="%{label}<br>%{value:,}건",
+            textposition="auto",
+        )
         st.plotly_chart(fig2, use_container_width=True)
+
+    st.markdown("### 2) 낙찰 특성 비율")
+    c1, c2 = st.columns(2)
+    with c1:
+        if "낙찰방법" in dwin.columns:
+            total = len(dwin)
+            suyi = (dwin["낙찰방법"] == "수의시담").sum()
+            st.metric(label="수의시담 비율", value=f"{(suyi / total * 100 if total else 0):.1f}%")
+        else:
+            st.info("낙찰방법 컬럼 없음")
+    with c2:
+        if "긴급공고" in dwin.columns:
+            total = len(dwin)
+            urgent = (dwin["긴급공고"] == "Y").sum()
+            st.metric(label="긴급공고 비율", value=f"{(urgent / total * 100 if total else 0):.1f}%")
+        else:
+            st.info("긴급공고 컬럼 없음")
+
+    st.markdown("### 3) 투찰율 산점도 & 4) 업체/년도별 수주금액")
+    col_scatter, col_bar3 = st.columns(2)
+    with col_scatter:
+        if "투찰율" in dwin.columns:
+            dwin["공고게시일자_date"] = pd.to_datetime(dwin.get("공고게시일자_date", pd.NaT), errors="coerce")
+            dplot = dwin.dropna(subset=["투찰율", "공고게시일자_date"]).copy()
+            dplot = dplot[dplot["투찰율"] <= 300]
+            hover_cols = [c for c in ["대표업체_표시", "수요기관명", "공고명", "입찰공고명", "입찰공고번호"] if c in dplot.columns]
+            fig_scatter = px.scatter(
+                dplot,
+                x="공고게시일자_date",
+                y="투찰율",
+                hover_data=hover_cols,
+                title="투찰율 산점도",
+                color="대표업체_표시",
+                color_discrete_map=VENDOR_COLOR_MAP,
+                color_discrete_sequence=OTHER_SEQ,
+            )
+            st.plotly_chart(fig_scatter, use_container_width=True)
+        else:
+            st.info("투찰율 컬럼 없음 - 산점도 생략")
+
+    with col_bar3:
+        if "투찰금액" in dwin.columns:
+            dyear = dwin.copy()
+            dyear["연도"] = pd.to_datetime(dyear.get("공고게시일자_date", pd.NaT), errors="coerce").dt.year
+            dyear = dyear.dropna(subset=["연도"]).astype({"연도": int})
+            by_vendor_year = dyear.groupby(["연도", "대표업체_표시"])["투찰금액"].sum().reset_index()
+            fig_vy = px.bar(
+                by_vendor_year,
+                x="연도",
+                y="투찰금액",
+                color="대표업체_표시",
+                barmode="group",
+                title="업체/년도별 수주금액",
+                color_discrete_map=VENDOR_COLOR_MAP,
+                color_discrete_sequence=OTHER_SEQ,
+            )
+            fig_vy.update_traces(hovertemplate="<b>%{x}년</b><br>%{legendgroup}: %{y:,.0f} 원")
+            st.plotly_chart(fig_vy, use_container_width=True)
+        else:
+            st.info("투찰금액 컬럼이 없어 '업체/년도별 수주금액'을 표시할 수 없습니다.")
+
+    st.markdown("### 5) 연·분기별 배정예산금액 — 누적 막대 & 총합")
+    col_stack, col_total = st.columns(2)
+    if "배정예산금액" not in dwin.columns:
+        with col_stack:
+            st.info("배정예산금액 컬럼 없음 - 막대그래프 생략")
+        return
+    dwin["공고게시일자_date"] = pd.to_datetime(dwin.get("공고게시일자_date", pd.NaT), errors="coerce")
+    g = dwin.dropna(subset=["공고게시일자_date"]).copy()
+    if g.empty:
+        with col_stack:
+            st.info("유효한 날짜가 없어 그래프 표시 불가")
+        return
+    g["연도"] = g["공고게시일자_date"].dt.year
+    g["분기"] = g["공고게시일자_date"].dt.quarter
+    g["연도분기"] = g["연도"].astype(str) + " Q" + g["분기"].astype(str)
+    if "대표업체_표시" not in g.columns:
+        g["대표업체_표시"] = g.get("대표업체", pd.Series([""] * len(g))).map(normalize_vendor)
+    title_col = "입찰공고명" if "입찰공고명" in g.columns else ("공고명" if "공고명" in g.columns else None)
+    group_col = "대표업체_표시"
+    if group_col not in g.columns:
+        with col_stack:
+            st.info("대표업체_표시 컬럼 없음")
+        return
+    with col_stack:
+        grp = g.groupby(["연도분기", group_col])["배정예산금액"].sum().reset_index(name="금액합")
+        if not grp.empty:
+            if title_col:
+                title_map = (
+                    g.groupby(["연도분기", group_col])[title_col]
+                    .apply(lambda s: " | ".join(pd.Series(s).dropna().astype(str).unique()[:10]))
+                    .rename("입찰공고목록")
+                    .reset_index()
+                )
+                grp = grp.merge(title_map, on=["연도분기", group_col], how="left")
+                grp["입찰공고목록"] = grp["입찰공고목록"].fillna("")
+            else:
+                grp["입찰공고목록"] = ""
+            grp["연"] = grp["연도분기"].str.extract(r"(\d{4})").astype(int)
+            grp["분"] = grp["연도분기"].str.extract(r"Q(\d)").astype(int)
+            grp = grp.sort_values(["연", "분", group_col]).reset_index(drop=True)
+            ordered_quarters = grp.sort_values(["연", "분"])["연도분기"].unique()
+            grp["연도분기"] = pd.Categorical(grp["연도분기"], categories=ordered_quarters, ordered=True)
+            import numpy as _np
+            custom = _np.column_stack([grp[group_col].astype(str).to_numpy(), grp["입찰공고목록"].astype(str).to_numpy()])
+            fig_stack = px.bar(
+                grp,
+                x="연도분기",
+                y="금액합",
+                color=group_col,
+                barmode="stack",
+                title=f"연·분기별 배정예산금액 — 누적(스택) / 그룹: {group_col}",
+                color_discrete_map=VENDOR_COLOR_MAP,
+                color_discrete_sequence=OTHER_SEQ,
+            )
+            fig_stack.update_traces(
+                customdata=custom,
+                hovertemplate=(
+                    "<b>%{x}</b><br>" +
+                    f"{group_col}: %{{customdata[0]}}<br>" +
+                    "금액: %{{y:,.0f}} 원<br>" +
+                    "입찰공고명: %{{customdata[1]}}"
+                ),
+            )
+            fig_stack.update_layout(xaxis_title="연도분기", yaxis_title="배정예산금액 (원)", margin=dict(l=10, r=10, t=60, b=10))
+            st.plotly_chart(fig_stack, use_container_width=True)
+        else:
+            st.info("그룹핑 결과가 비어 있습니다.")
+    with col_total:
+        grp_total = g.groupby("연도분기")["배정예산금액"].sum().reset_index(name="금액합")
+        grp_total["연"] = grp_total["연도분기"].str.extract(r"(\d{4})").astype(int)
+        grp_total["분"] = grp_total["연도분기"].str.extract(r"Q(\d)").astype(int)
+        grp_total = grp_total.sort_values(["연", "분"])
+        if title_col:
+            titles_total = (
+                g.groupby("연도분기")[title_col]
+                .apply(lambda s: " | ".join(pd.Series(s).dropna().astype(str).unique()[:10]))
+                .reindex(grp_total["연도분기"]).fillna("")
+            )
+            import numpy as _np
+            custom2 = _np.stack([titles_total], axis=-1)
+        else:
+            import numpy as _np
+            custom2 = _np.stack([pd.Series([""] * len(grp_total))], axis=-1)
+        fig_bar = px.bar(grp_total, x="연도분기", y="금액합", title="연·분기별 배정예산금액 (총합)", text="금액합")
+        fig_bar.update_traces(
+            customdata=custom2,
+            hovertemplate="<b>%{x}</b><br>총액: %{y:,.0f} 원<br>입찰공고명: %{customdata[0]}",
+            texttemplate='%{text:,.0f}',
+            textposition='outside',
+            cliponaxis=False,
+        )
+        st.plotly_chart(fig_bar, use_container_width=True)
 
 
 # =============================
@@ -1332,11 +1453,16 @@ elif menu_val == "내고객 분석하기":
                                     lambda x: '' if pd.isna(x) else re.sub(r"<[^>]+>", "", str(x))
                                 )
                             )
+                
+                # ===== 여기 추가: 고객 분석 결과에 대한 그래프 분석 =====
+                st.markdown("---")
+                st.subheader("📊 고객사별 통계 분석 (검색된 데이터 기준)")
+                with st.expander("차트 보기", expanded=True):
+                    render_basic_analysis_charts(result) # result DF를 넘겨서 차트 그리기
 
                 # ===== Gemini 분석 =====
                 st.markdown("---")
                 st.subheader("🤖 Gemini 분석")
-                # [삭제됨] 캡션 삭제 요청 반영됨
 
                 src_files = st.file_uploader(
                     "분석할 파일 업로드 (여러 개 가능)",
@@ -1399,13 +1525,31 @@ elif menu_val == "내고객 분석하기":
                 if report_md:
                     st.markdown("### 📝 Gemini 분석 보고서")
                     st.markdown(report_md)
+                    
+                    # ✅ 파일명 추출 및 전처리 로직 (Gemini 제목 기준)
+                    report_title = "Gemini_Analysis_Report" # 기본값
+                    if report_md:
+                        # 첫 번째 헤더(# ...) 찾기
+                        match = re.search(r"^#\s+(.*)", report_md, re.MULTILINE)
+                        if match:
+                            raw_title = match.group(1).strip()
+                        else:
+                            # 헤더 없으면 첫 줄 사용 (길이 제한)
+                            raw_title = report_md.split('\n')[0].strip()[:50]
+                        
+                        # 특수문자 제거 및 공백을 _로 치환
+                        safe_title = re.sub(r"[^\w\s-가-힣]", "_", raw_title)
+                        safe_title = re.sub(r"\s+", "_", safe_title)
+                        if safe_title:
+                            report_title = safe_title
 
-                    base_fname = f"{'_'.join(customers)}_Gemini분석_{datetime.now().strftime('%Y%m%d_%H%M')}"
+                    # 날짜 추가
+                    final_filename = f"{report_title}_{datetime.now().strftime('%Y%m%d')}"
 
                     st.download_button(
                         "📥 보고서 다운로드 (.md)",
                         data=report_md.encode("utf-8"),
-                        file_name=f"{base_fname}.md",
+                        file_name=f"{final_filename}.md",
                         mime="text/markdown",
                         use_container_width=True
                     )
@@ -1415,7 +1559,7 @@ elif menu_val == "내고객 분석하기":
                         st.download_button(
                             "📥 보고서 다운로드 (.pdf)",
                             data=pdf_bytes,
-                            file_name=f"{base_fname}.pdf",
+                            file_name=f"{final_filename}.pdf",
                             mime="application/pdf",
                             use_container_width=True
                         )
@@ -1476,3 +1620,6 @@ elif menu_val == "내고객 분석하기":
 
                 for m in st.session_state.get("chat_messages", []):
                     st.chat_message("user" if m["role"] == "user" else "assistant").markdown(m["content"])
+
+# == E O S == 
+
