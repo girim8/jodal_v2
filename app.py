@@ -155,10 +155,9 @@ def _gemini_messages_to_contents(messages):
     return contents
 
 
-def call_gemini(messages, temperature=0.4, max_tokens=2000, model="gemini-2.0-flash"):
+def call_gemini(messages, temperature=0.4, max_tokens=2000, model="gemini-2.0-flash-exp"):
     """
-    Gemini API 호출 (Smart Fallback + 사용 모델 반환)
-    Return: (응답텍스트, 사용된모델명)
+    Gemini API 호출 (Gemini 2.0 전용, 단순화됨)
     """
     key = _get_gemini_key()
     if not key:
@@ -177,60 +176,39 @@ def call_gemini(messages, temperature=0.4, max_tokens=2000, model="gemini-2.0-fl
     safe_messages = [guardrail_system] + messages
     contents = _gemini_messages_to_contents(safe_messages)
 
-    # 시도할 모델 순서 (2.0 -> 1.5)
-    candidate_models = ["gemini-2.0-flash", "gemini-1.5-flash"]
-    last_exception = None
-
-    for current_model in candidate_models:
-        url = f"{GEMINI_API_BASE}/{current_model}:generateContent"
-        headers = {"Content-Type": "application/json", "X-goog-api-key": key}
-        
-        payload = {
-            "contents": contents,
-            "generationConfig": {
-                "temperature": float(temperature),
-                "maxOutputTokens": int(max_tokens),
-            }
+    # ✅ 모델명 고정 (필요시 'gemini-2.0-flash' 등으로 변경 가능)
+    target_model = model 
+    url = f"{GEMINI_API_BASE}/{target_model}:generateContent"
+    headers = {"Content-Type": "application/json", "X-goog-api-key": key}
+    
+    payload = {
+        "contents": contents,
+        "generationConfig": {
+            "temperature": float(temperature),
+            "maxOutputTokens": int(max_tokens),
         }
+    }
 
-        # 2.0은 1번 시도하고 429나면 바로 1.5로. 1.5는 3번까지 재시도.
-        max_retries = 1 if current_model == "gemini-2.0-flash" else 3
+    try:
+        # 타임아웃만 넉넉히 설정
+        r = requests.post(url, headers=headers, data=json.dumps(payload), timeout=60)
+        r.raise_for_status()
+        data = r.json()
         
-        for attempt in range(max_retries):
-            try:
-                r = requests.post(url, headers=headers, data=json.dumps(payload), timeout=60)
-                r.raise_for_status()
-                data = r.json()
-                
-                candidates = data.get("candidates", [])
-                if not candidates:
-                    if data.get("promptFeedback"):
-                        return f"[차단됨] 피드백: {data['promptFeedback']}", current_model
-                    raise Exception(f"candidates 비어있음: {data}")
-                
-                parts = candidates[0]["content"]["parts"]
-                text = "\n".join([p.get("text", "") for p in parts]).strip()
-                
-                if text:
-                    # ✅ 성공 시 텍스트와 모델명을 함께 반환
-                    return text, current_model
-                    
-            except requests.exceptions.HTTPError as e:
-                if e.response.status_code in [429, 503]:
-                    last_exception = e
-                    if current_model == "gemini-2.0-flash":
-                        # 2.0 과부하 -> 즉시 1.5로 전환 (잠시 숨 고르기)
-                        time.sleep(1)
-                        break 
-                    
-                    # 1.5 과부하 -> 대기 후 재시도
-                    time.sleep(2 ** (attempt + 1))
-                    continue
-                raise Exception(f"Gemini 호출 실패 ({current_model}): {e}")
-            except Exception as e:
-                raise Exception(f"API 호출 중 예외: {e}")
+        candidates = data.get("candidates", [])
+        if not candidates:
+            if data.get("promptFeedback"):
+                return f"[차단됨] 피드백: {data['promptFeedback']}", target_model
+            raise Exception(f"응답 없음 (candidates Empty): {data}")
+        
+        parts = candidates[0]["content"]["parts"]
+        text = "\n".join([p.get("text", "") for p in parts]).strip()
+        
+        return text, target_model
 
-    raise Exception(f"모든 모델 호출 실패. Last Error: {last_exception}")
+    except Exception as e:
+        # 재시도 로직 없이 바로 에러 반환
+        raise Exception(f"Gemini({target_model}) 호출 실패: {e}")
 
 
 # =============================
@@ -264,17 +242,17 @@ def gemini_try_extract_text_from_file(
     filename: str,
     temperature: float = 0.2,
     max_tokens: int = 2048,
-    model: str = "gemini-2.0-flash",
-) -> tuple[str | None, str | None]:  # ✅ 반환 타입 변경 (텍스트, 모델명)
+    model: str = "gemini-2.0-flash-exp",
+) -> tuple[str | None, str | None]:
     """
-    파일 텍스트 추출 (Smart Fallback + 사용 모델 반환)
+    파일 텍스트 추출 (Gemini 2.0 전용, 단순화됨)
     """
     key = _get_gemini_key()
     if not key:
         return None, None
 
     mime_type = guess_mime_type(filename)
-    if len(file_bytes) > 15 * 1024 * 1024:
+    if len(file_bytes) > 15 * 1024 * 1024: # 15MB 제한
         return None, None
 
     prompt = dedent(f"""
@@ -285,62 +263,49 @@ def gemini_try_extract_text_from_file(
     - 추출 불가하면 'EXTRACTION_FAILED'라고만 답해.
     """).strip()
 
-    candidate_models = ["gemini-2.0-flash", "gemini-1.5-flash"]
+    target_model = model
+    url = f"{GEMINI_API_BASE}/{target_model}:generateContent"
+    headers = {"Content-Type": "application/json", "X-goog-api-key": key}
 
-    for current_model in candidate_models:
-        payload = {
-            "contents": [{
-                "role": "user",
-                "parts": [
-                    {"text": prompt},
-                    {
-                        "inline_data": {
-                            "mime_type": mime_type,
-                            "data": base64.b64encode(file_bytes).decode("ascii")
-                        }
+    payload = {
+        "contents": [{
+            "role": "user",
+            "parts": [
+                {"text": prompt},
+                {
+                    "inline_data": {
+                        "mime_type": mime_type,
+                        "data": base64.b64encode(file_bytes).decode("ascii")
                     }
-                ]
-            }],
-            "generationConfig": {
-                "temperature": float(temperature),
-                "maxOutputTokens": int(max_tokens),
-            }
+                }
+            ]
+        }],
+        "generationConfig": {
+            "temperature": float(temperature),
+            "maxOutputTokens": int(max_tokens),
         }
+    }
 
-        url = f"{GEMINI_API_BASE}/{current_model}:generateContent"
-        headers = {"Content-Type": "application/json", "X-goog-api-key": key}
-
-        try:
-            r = requests.post(url, headers=headers, data=json.dumps(payload), timeout=60)
-            r.raise_for_status()
-            data = r.json()
-            
-            candidates = data.get("candidates", [])
-            if not candidates:
-                continue
-                
-            parts = candidates[0]["content"]["parts"]
-            text = "\n".join([p.get("text", "") for p in parts]).strip()
-            
-            if (not text) or ("EXTRACTION_FAILED" in text) or (len(text) < 30):
-                continue
-            
-            # ✅ 성공 시 (텍스트, 모델명) 반환
-            return _redact_secrets(text), current_model
-
-        except requests.exceptions.HTTPError as e:
-            if e.response.status_code in [429, 503]:
-                if current_model == "gemini-2.0-flash":
-                    time.sleep(1)
-                    continue
-                else:
-                    return None, None
+    try:
+        r = requests.post(url, headers=headers, data=json.dumps(payload), timeout=60)
+        r.raise_for_status()
+        data = r.json()
+        
+        candidates = data.get("candidates", [])
+        if not candidates:
             return None, None
-        except Exception:
-            continue
+            
+        parts = candidates[0]["content"]["parts"]
+        text = "\n".join([p.get("text", "") for p in parts]).strip()
+        
+        if (not text) or ("EXTRACTION_FAILED" in text) or (len(text) < 30):
+            return None, None
+        
+        return _redact_secrets(text), target_model
 
-    return None, None
-
+    except Exception:
+        # 실패 시 조용히 None 반환 (다음 로컬 추출 로직으로 넘어가기 위함)
+        return None, None
 
 # =============================
 # ✅ HWP/HWPX 로컬 텍스트 추출
