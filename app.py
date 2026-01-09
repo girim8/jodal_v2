@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
-# app.py — Streamlit Cloud 단일 파일 통합본 (Clean Version)
-# - Features: Multi-Key Rotation, Sidebar Key Priority, Gemini 2.0 Fixed, Robust Auth
-# - Fixes: Regex Error (Bad character range), Full Removal of CloudConvert
-# - Update: Enhanced Prompt for Summary Table (Emphasis Analysis)
+# app.py — Streamlit Cloud 단일 파일 통합본 (Gemini 3.0 Ready)
+# - Features: Multi-Key Rotation, Sidebar Key Priority, Robust Auth
+# - Model: gemini-3.0-flash (Global Variable Controlled)
+# - Fixes: Emergency Notice Pie Chart, Regex Error, No CloudConvert
 
 import os
 import re
@@ -36,8 +36,11 @@ import olefile
 
 
 # =============================
-# 전역/메타
+# 전역 설정 (모델명 관리)
 # =============================
+# ✅ 사용할 모델명을 여기서 한 번만 설정하면 전체 코드에 적용됩니다.
+CURRENT_MODEL_NAME = "gemini-3.0-flash" 
+
 st.set_page_config(page_title="조달입찰 분석 시스템", layout="wide", initial_sidebar_state="expanded")
 st.markdown(
     """
@@ -165,7 +168,11 @@ def _gemini_messages_to_contents(messages):
     return contents
 
 
-def call_gemini(messages, temperature=0.4, max_tokens=2000, model="gemini-2.0-flash-exp"):
+def call_gemini(messages, temperature=0.4, max_tokens=2000, model=CURRENT_MODEL_NAME):
+    """
+    Gemini API 호출 함수
+    Default Model: CURRENT_MODEL_NAME (gemini-3.0-flash)
+    """
     key_list = _get_gemini_key_list()
     if not key_list:
         raise Exception("Gemini API 키가 설정되지 않았습니다.")
@@ -257,7 +264,7 @@ def gemini_try_extract_text_from_file(
     filename: str,
     temperature: float = 0.2,
     max_tokens: int = 2048,
-    model: str = "gemini-2.0-flash-exp",
+    model: str = CURRENT_MODEL_NAME,
 ) -> tuple[str | None, str | None]:
     
     key_list = _get_gemini_key_list()
@@ -1060,7 +1067,7 @@ def render_basic_analysis_charts(base_df: pd.DataFrame):
     except Exception as e:
         st.error(f"1번 차트 생성 중 오류 발생: {e}")
 
-    # 2) 낙찰 특성 비율 (Metrics)
+    # 2) 낙찰 특성 비율 (Metrics & Pie Chart)
     try:
         st.markdown("### 2) 낙찰 특성 비율")
         c1, c2 = st.columns(2)
@@ -1071,13 +1078,37 @@ def render_basic_analysis_charts(base_df: pd.DataFrame):
                 st.metric(label="수의시담 비율", value=f"{(suyi / total * 100 if total else 0):.1f}%")
             else:
                 st.info("낙찰방법 컬럼 없음")
+        
         with c2:
-            if "긴급공고" in dwin.columns:
-                total = len(dwin)
-                urgent = (dwin["긴급공고"] == "Y").sum()
-                st.metric(label="긴급공고 비율", value=f"{(urgent / total * 100 if total else 0):.1f}%")
+            # ✅ 긴급공고여부 또는 긴급공고 컬럼 확인
+            col_urgent = "긴급공고여부" if "긴급공고여부" in dwin.columns else ("긴급공고" if "긴급공고" in dwin.columns else None)
+            
+            if col_urgent:
+                # 데이터 전처리: 결측치 및 공백 처리
+                # Y, N, ""(공백), NaN 등을 모두 처리
+                s_urgent = dwin[col_urgent].fillna("미입력").astype(str).str.strip()
+                s_urgent = s_urgent.replace({"": "미입력", "nan": "미입력"})
+                
+                # 빈도 계산
+                dist_urgent = s_urgent.value_counts().reset_index()
+                dist_urgent.columns = ["여부", "건수"]
+                
+                # 파이차트 생성
+                fig_urgent = px.pie(
+                    dist_urgent,
+                    names="여부",
+                    values="건수",
+                    title=f"긴급공고 여부 비율 ({col_urgent})",
+                    hole=0.3
+                )
+                fig_urgent.update_traces(
+                    hovertemplate="<b>%{label}</b><br>건수: %{value}건<br>비율: %{percent}",
+                    textinfo='percent+label'
+                )
+                st.plotly_chart(fig_urgent, use_container_width=True)
             else:
-                st.info("긴급공고 컬럼 없음")
+                st.info("긴급공고/긴급공고여부 컬럼이 없어 비율 분석을 생략합니다.")
+                
     except Exception as e:
         st.error(f"2번 지표 생성 중 오류 발생: {e}")
 
@@ -1398,7 +1429,8 @@ elif menu_val == "내고객 분석하기":
                 # ===== 고객 분석 결과 그래프 =====
                 st.markdown("---")
                 st.subheader("📊 고객사별 통계 분석 (검색된 데이터 기준)")
-                with st.expander("차트 보기", expanded=True):
+                # ✅ 수정됨: 기본적으로 닫혀있도록 expanded=False 설정
+                with st.expander("차트 보기", expanded=False):
                     render_basic_analysis_charts(result)
 
                 # ===== Gemini 분석 =====
@@ -1454,7 +1486,7 @@ elif menu_val == "내고객 분석하기":
                                             {"role": "system", "content": "당신은 SK브로드밴드 망설계/조달 제안 컨설턴트입니다."},
                                             {"role": "user", "content": prompt},
                                         ],
-                                        model="gemini-2.0-flash-exp",
+                                        model=CURRENT_MODEL_NAME,
                                         max_tokens=4000, # 요약표 포함 위해 토큰 증량
                                         temperature=0.3,
                                     )
@@ -1539,7 +1571,7 @@ elif menu_val == "내고객 분석하기":
                                 {"role": "system", "content": "당신은 조달/통신 제안 분석 챗봇입니다. 컨텍스트 기반으로만 답하세요."},
                                 {"role": "user", "content": q_prompt},
                             ],
-                            model="gemini-2.0-flash-exp",
+                            model=CURRENT_MODEL_NAME,
                             max_tokens=1200,
                             temperature=0.2,
                         )
