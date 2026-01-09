@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
-# app.py — Streamlit Cloud 단일 파일 통합본 (No-CloudConvert Version)
+# app.py — Streamlit Cloud 단일 파일 통합본 (Clean Version)
 # - Features: Multi-Key Rotation, Sidebar Key Priority, Gemini 2.0 Fixed, Robust Auth
-# - Removed: CloudConvert Dependency (Pure Gemini + Local Extraction)
+# - Fixes: Regex Error (Bad character range), Full Removal of CloudConvert
 # - Update: Enhanced Prompt for Summary Table (Emphasis Analysis)
 
 import os
@@ -16,7 +16,6 @@ from urllib.parse import urlparse, unquote
 from textwrap import dedent
 from datetime import datetime
 from pathlib import Path
-from math import isfinite
 
 import streamlit as st
 import pandas as pd
@@ -1258,8 +1257,6 @@ BINARY_EXTS = {".hwp", ".hwpx", ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx
 
 def extract_text_combo_gemini_first(uploaded_files):
     combined_texts, convert_logs = [], []
-    # generated_pdfs는 더 이상 사용하지 않지만 호환성을 위해 빈 리스트 유지
-    generated_pdfs = [] 
 
     for idx, f in enumerate(uploaded_files):
         name = f.name
@@ -1317,7 +1314,7 @@ def extract_text_combo_gemini_first(uploaded_files):
 
         convert_logs.append(f"ℹ️ {name}: 미지원 형식(패스)")
 
-    return "\n".join(combined_texts).strip(), convert_logs, generated_pdfs
+    return "\n".join(combined_texts).strip(), convert_logs, []
 
 
 # =============================
@@ -1483,12 +1480,13 @@ elif menu_val == "내고객 분석하기":
                     st.markdown("### 📝 Gemini 분석 보고서")
                     st.markdown(report_md)
                     
-                    # 파일명 자동 생성
+                    # 파일명 자동 생성 (Regex 수정됨)
                     report_title = "Gemini_Analysis_Report"
                     match = re.search(r"^#\s+(.*)", report_md, re.MULTILINE)
                     if match:
                         raw_title = match.group(1).strip()
-                        safe_title = re.sub(r"[^\w\s-가-힣]", "_", raw_title)
+                        # 하이픈을 대괄호 맨 뒤로 이동하여 범위 오류 방지
+                        safe_title = re.sub(r"[^\w\s가-힣-]", "_", raw_title)
                         report_title = re.sub(r"\s+", "_", safe_title)
                     
                     final_filename = f"{report_title}_{datetime.now().strftime('%Y%m%d')}"
