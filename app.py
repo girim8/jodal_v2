@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
-# app.py — Streamlit Cloud 단일 파일 통합본 (Final Robust Version)
+# app.py — Streamlit Cloud 단일 파일 통합본 (No-CloudConvert Version)
 # - Features: Multi-Key Rotation, Sidebar Key Priority, Gemini 2.0 Fixed, Robust Auth
-# - Fixes: Enhanced Error Handling for Charts, Smart Date Parsing, Auto Filename
+# - Removed: CloudConvert Dependency (Pure Gemini + Local Extraction)
+# - Update: Enhanced Prompt for Summary Table (Emphasis Analysis)
 
 import os
 import re
@@ -57,7 +58,6 @@ GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
 # =============================
 for k, v in {
     "gpt_report_md": None,
-    "generated_src_pdfs": [],
     "gpt_convert_logs": [],
     "authed": False,
     "chat_messages": [],
@@ -80,7 +80,7 @@ def _redact_secrets(text: str) -> str:
     text = re.sub(r"sk-[A-Za-z0-9_\-]{20,}", "[REDACTED_KEY]", text)
     text = re.sub(r"AIza[0-9A-Za-z\-_]{20,}", "[REDACTED_GEMINI_KEY]", text)
     text = re.sub(
-        r'(?i)\b(gpt_api_key|OPENAI_API_KEY|GEMINI_API_KEY|CLOUDCONVERT_API_KEY)\s*=\s*([\'\"]).*?\2',
+        r'(?i)\b(gpt_api_key|OPENAI_API_KEY|GEMINI_API_KEY)\s*=\s*([\'\"]).*?\2',
         r'\1=\2[REDACTED]\2',
         text,
     )
@@ -441,95 +441,6 @@ def convert_to_text(data: bytes, filename: str | None = None) -> tuple[str, str]
 
 
 # =============================
-# CloudConvert API
-# =============================
-CLOUDCONVERT_API_BASE = "https://api.cloudconvert.com/v2"
-
-
-def _get_cloudconvert_key() -> str | None:
-    try:
-        key = st.secrets.get("CLOUDCONVERT_API_KEY") if "CLOUDCONVERT_API_KEY" in st.secrets else None
-    except Exception:
-        key = None
-    return key or os.environ.get("CLOUDCONVERT_API_KEY")
-
-
-@st.cache_data(show_spinner=False)
-def _cloudconvert_supported() -> bool:
-    return _get_cloudconvert_key() is not None
-
-
-def cloudconvert_convert_to_pdf(file_bytes: bytes, filename: str, timeout_sec: int = 180) -> tuple[bytes | None, str]:
-    api_key = _get_cloudconvert_key()
-    if not api_key:
-        return None, "CloudConvert 키 없음"
-
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    job_payload = {
-        "tasks": {
-            "import-my-file": {
-                "operation": "import/base64",
-                "file": base64.b64encode(file_bytes).decode("ascii"),
-                "filename": filename,
-            },
-            "convert-it": {
-                "operation": "convert",
-                "input": "import-my-file",
-                "output_format": "pdf",
-            },
-            "export-it": {
-                "operation": "export/url",
-                "input": "convert-it",
-                "inline": False,
-                "archive_multiple_files": False,
-            },
-        }
-    }
-
-    try:
-        r = requests.post(f"{CLOUDCONVERT_API_BASE}/jobs", headers=headers, data=json.dumps(job_payload), timeout=30)
-        r.raise_for_status()
-        job = r.json().get("data", {})
-        job_id = job.get("id")
-        if not job_id:
-            return None, f"CloudConvert Job 생성 실패: {r.text[:200]}"
-    except Exception as e:
-        return None, f"CloudConvert Job 생성 예외: {e}"
-
-    import time
-    start = time.time()
-    export_files = None
-    while time.time() - start < timeout_sec:
-        try:
-            g = requests.get(f"{CLOUDCONVERT_API_BASE}/jobs/{job_id}", headers=headers, timeout=15)
-            g.raise_for_status()
-            data = g.json().get("data", {})
-            tasks = data.get("tasks", [])
-            for t in tasks:
-                if t.get("name") == "export-it" and t.get("status") == "finished":
-                    export_files = t.get("result", {}).get("files", [])
-                    break
-            if export_files:
-                break
-            time.sleep(2)
-        except Exception:
-            time.sleep(2)
-
-    if not export_files:
-        return None, "CloudConvert 변환 대기 타임아웃"
-
-    try:
-        url = export_files[0].get("url")
-        if not url:
-            return None, "URL 없음"
-        dr = requests.get(url, timeout=90)
-        dr.raise_for_status()
-        return dr.content, "OK[CloudConvert]"
-    except Exception as e:
-        return None, f"다운로드 실패: {e}"
-
-
-# =============================
 # PDF 텍스트 추출
 # =============================
 try:
@@ -561,7 +472,7 @@ def markdown_to_pdf_korean(md_text: str, title: str | None = None):
         else:
             source_md = md_text
 
-        html_text = md_lib.markdown(source_md)
+        html_text = md_lib.markdown(source_md, extensions=['tables'])
 
         html_content = f"""
         <html>
@@ -934,11 +845,6 @@ def render_sidebar_base():
         else:
             st.sidebar.warning("⚠️ Gemini 키가 없습니다.")
 
-    if _cloudconvert_supported():
-        st.sidebar.success("CloudConvert 사용 가능")
-    else:
-        st.sidebar.warning("CloudConvert 비활성 — st.secrets 필요")
-
 
 def render_sidebar_filters(df: pd.DataFrame):
     st.sidebar.markdown("---")
@@ -1300,8 +1206,8 @@ def render_basic_analysis_charts(base_df: pd.DataFrame):
                             hovertemplate=(
                                 "<b>%{x}</b><br>" +
                                 f"{group_col}: %{{customdata[0]}}<br>" +
-                                "금액: %{{y:,.0f}} 원<br>" +
-                                "입찰공고명: %{{customdata[1]}}"
+                                "금액: %{y:,.0f} 원<br>" +
+                                "입찰공고명: %{customdata[1]}"
                             ),
                         )
                         fig_stack.update_layout(xaxis_title="연도분기", yaxis_title="배정예산금액 (원)", margin=dict(l=10, r=10, t=60, b=10))
@@ -1343,7 +1249,7 @@ def render_basic_analysis_charts(base_df: pd.DataFrame):
 
 
 # =============================
-# LLM 분석용 텍스트 추출 (Smart Fallback 적용)
+# LLM 분석용 텍스트 추출 (Pure Gemini + Local)
 # =============================
 TEXT_EXTS = {".txt", ".csv", ".md", ".log"}
 DIRECT_PDF_EXTS = {".pdf"}
@@ -1351,7 +1257,9 @@ BINARY_EXTS = {".hwp", ".hwpx", ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx
 
 
 def extract_text_combo_gemini_first(uploaded_files):
-    combined_texts, convert_logs, generated_pdfs = [], [], []
+    combined_texts, convert_logs = [], []
+    # generated_pdfs는 더 이상 사용하지 않지만 호환성을 위해 빈 리스트 유지
+    generated_pdfs = [] 
 
     for idx, f in enumerate(uploaded_files):
         name = f.name
@@ -1362,7 +1270,7 @@ def extract_text_combo_gemini_first(uploaded_files):
         if idx > 0:
             time.sleep(1.5)
         
-        # ✅ 반환값 2개(텍스트, 모델) 받기
+        # 1. Gemini 직접 추출 시도 (바이너리/이미지 포함)
         gem_txt, used_model = gemini_try_extract_text_from_file(data, name)
         
         if gem_txt:
@@ -1370,8 +1278,9 @@ def extract_text_combo_gemini_first(uploaded_files):
             combined_texts.append(f"\n\n===== [{name} | Gemini-{used_model}] =====\n{gem_txt}\n")
             continue
         else:
-            convert_logs.append(f"🤖 {name}: Gemini 추출 실패 → 폴백 진행")
+            convert_logs.append(f"🤖 {name}: Gemini 추출 실패 → 로컬 폴백 진행")
 
+        # 2. 로컬 라이브러리 폴백
         if ext in {".hwp", ".hwpx"}:
             try:
                 txt, fmt = convert_to_text(data, name)
@@ -1379,7 +1288,7 @@ def extract_text_combo_gemini_first(uploaded_files):
                 combined_texts.append(f"\n\n===== [{name} | 로컬 {fmt} 추출] =====\n{_redact_secrets(txt)}\n")
                 continue
             except Exception as e:
-                convert_logs.append(f"📄 {name}: 로컬 HWP/HWPX 추출 실패 ({e}) → 다음 단계")
+                convert_logs.append(f"📄 {name}: 로컬 HWP/HWPX 추출 실패 ({e}) → 실패")
 
         if ext in TEXT_EXTS:
             for enc in ("utf-8-sig", "utf-8", "cp949", "euc-kr"):
@@ -1400,16 +1309,10 @@ def extract_text_combo_gemini_first(uploaded_files):
             convert_logs.append(f"✅ {name}: 로컬 PDF 텍스트 추출 {len(txt)} chars")
             combined_texts.append(f"\n\n===== [{name}] =====\n{_redact_secrets(txt)}\n")
             continue
-
+            
+        # CloudConvert 제거됨 -> 미지원 형식 로그만 남김
         if ext in BINARY_EXTS:
-            pdf_bytes, dbg = cloudconvert_convert_to_pdf(data, name)
-            if pdf_bytes:
-                generated_pdfs.append((os.path.splitext(name)[0] + ".pdf", pdf_bytes))
-                txt = extract_text_from_pdf_bytes(pdf_bytes)
-                convert_logs.append(f"✅ {name} → CloudConvert PDF 성공 ({dbg}), 텍스트 {len(txt)} chars")
-                combined_texts.append(f"\n\n===== [{name} → CloudConvert PDF] =====\n{_redact_secrets(txt)}\n")
-            else:
-                convert_logs.append(f"🛑 {name}: CloudConvert 실패 ({dbg})")
+            convert_logs.append(f"ℹ️ {name}: 바이너리 직접 추출 실패 (Gemini가 읽지 못함)")
             continue
 
         convert_logs.append(f"ℹ️ {name}: 미지원 형식(패스)")
@@ -1495,11 +1398,11 @@ elif menu_val == "내고객 분석하기":
                                 )
                             )
                 
-                # ===== 여기 추가: 고객 분석 결과에 대한 그래프 분석 =====
+                # ===== 고객 분석 결과 그래프 =====
                 st.markdown("---")
                 st.subheader("📊 고객사별 통계 분석 (검색된 데이터 기준)")
                 with st.expander("차트 보기", expanded=True):
-                    render_basic_analysis_charts(result) # result DF를 넘겨서 차트 그리기
+                    render_basic_analysis_charts(result)
 
                 # ===== Gemini 분석 =====
                 st.markdown("---")
@@ -1517,7 +1420,7 @@ elif menu_val == "내고객 분석하기":
                         st.warning("먼저 분석할 파일을 업로드하세요.")
                     else:
                         with st.spinner("Gemini가 업로드된 자료로 보고서를 작성 중..."):
-                            combined_text, logs, generated_pdfs = extract_text_combo_gemini_first(src_files)
+                            combined_text, logs, _ = extract_text_combo_gemini_first(src_files)
 
                             st.session_state["gpt_convert_logs"] = logs
 
@@ -1526,29 +1429,43 @@ elif menu_val == "내고객 분석하기":
                             else:
                                 prompt = f"""
 다음은 조달/입찰 관련 문서들의 텍스트입니다.
-핵심 요구사항, 기술/가격 평가 비율, 계약조건, 월과 일을 포함한 정확한 일정(입찰 마감/계약기간),
-공동수급/하도급/긴급공고 여부, 주요 장비/스펙/구간,
-배정예산/추정가격/예가 등을 표와 불릿으로 요약하세요.
+전체적인 내용을 분석하고, **핵심 요구사항**, **평가 요소**, **제안 전략**을 포함하여 보고서를 작성하세요.
+
+**[필수 요청사항]**
+보고서 맨 마지막에 다음 항목을 포함한 **요약표**를 반드시 작성해 주세요. (없으면 '정보 없음' 표기)
+
+| 항목 | 내용 |
+|---|---|
+| 사업명 | (공고명 확인) |
+| 평가비율 | 기술 X : 가격 Y (예: 90:10, 80:20 등) |
+| 입찰/제안 마감일시 | YYYY-MM-DD HH:MM |
+| 제안서 평가일시 | YYYY-MM-DD HH:MM |
+| 공동수급 허용여부 | 허용 / 불허 (조건 포함) |
+| 하도급 허용여부 | 허용 / 불허 (조건 포함) |
+| 주요 장비/스펙 | (핵심 HW/SW 요약) |
+| 배정예산/예가 | (금액 확인) |
+| 리스크(독소조항) | (페널티, 까다로운 조건 등) |
+| **고객 강조 포인트** | (문맥상 강조된 부분, 문서 내 밑줄/BOLD 처리된 중요 요구사항 분석) |
 
 [문서 통합 텍스트]
 {combined_text[:180000]}
 """.strip()
                                 try:
-                                    # ✅ 반환값 2개 받기
+                                    # Gemini 호출
                                     report, used_model = call_gemini(
                                         [
                                             {"role": "system", "content": "당신은 SK브로드밴드 망설계/조달 제안 컨설턴트입니다."},
                                             {"role": "user", "content": prompt},
                                         ],
                                         model="gemini-2.0-flash-exp",
-                                        max_tokens=2000,
-                                        temperature=0.4,
+                                        max_tokens=4000, # 요약표 포함 위해 토큰 증량
+                                        temperature=0.3,
                                     )
 
                                     st.session_state["gpt_report_md"] = report
-                                    st.session_state["generated_src_pdfs"] = generated_pdfs
+                                    # PDF 생성 로직 제거되었으므로 리스트 비움
+                                    st.session_state["generated_src_pdfs"] = []
 
-                                    # ✅ 화면에 사용된 모델 표시
                                     st.success(f"보고서 생성이 완료되었습니다. (사용된 모델: **{used_model}**)")
 
                                 except Exception as e:
@@ -1561,30 +1478,19 @@ elif menu_val == "내고객 분석하기":
                         st.write("- " + line)
 
                 report_md = st.session_state.get("gpt_report_md")
-                generated_pdfs = st.session_state.get("generated_src_pdfs", [])
 
                 if report_md:
                     st.markdown("### 📝 Gemini 분석 보고서")
                     st.markdown(report_md)
                     
-                    # ✅ 파일명 추출 및 전처리 로직 (Gemini 제목 기준)
-                    report_title = "Gemini_Analysis_Report" # 기본값
-                    if report_md:
-                        # 첫 번째 헤더(# ...) 찾기
-                        match = re.search(r"^#\s+(.*)", report_md, re.MULTILINE)
-                        if match:
-                            raw_title = match.group(1).strip()
-                        else:
-                            # 헤더 없으면 첫 줄 사용 (길이 제한)
-                            raw_title = report_md.split('\n')[0].strip()[:50]
-                        
-                        # 특수문자 제거 및 공백을 _로 치환
+                    # 파일명 자동 생성
+                    report_title = "Gemini_Analysis_Report"
+                    match = re.search(r"^#\s+(.*)", report_md, re.MULTILINE)
+                    if match:
+                        raw_title = match.group(1).strip()
                         safe_title = re.sub(r"[^\w\s-가-힣]", "_", raw_title)
-                        safe_title = re.sub(r"\s+", "_", safe_title)
-                        if safe_title:
-                            report_title = safe_title
-
-                    # 날짜 추가
+                        report_title = re.sub(r"\s+", "_", safe_title)
+                    
                     final_filename = f"{report_title}_{datetime.now().strftime('%Y%m%d')}"
 
                     st.download_button(
@@ -1605,19 +1511,6 @@ elif menu_val == "내고객 분석하기":
                             use_container_width=True
                         )
                         st.caption(f"PDF 생성 상태: {dbg}")
-
-                    if generated_pdfs:
-                        st.markdown("---")
-                        st.markdown("### 🗂️ CloudConvert로 변환된 PDF 내려받기")
-                        for i, (fname, pbytes) in enumerate(generated_pdfs):
-                            st.download_button(
-                                label=f"📥 {fname}",
-                                data=pbytes,
-                                file_name=fname,
-                                mime="application/pdf",
-                                key=f"dl_ccpdf_{i}",
-                                use_container_width=True,
-                            )
 
                 # ===== 컨텍스트 챗봇 =====
                 st.markdown("---")
@@ -1643,7 +1536,6 @@ elif menu_val == "내고객 분석하기":
 """.strip()
 
                     try:
-                        # ✅ 반환값 2개 받기
                         ans, used_model = call_gemini(
                             [
                                 {"role": "system", "content": "당신은 조달/통신 제안 분석 챗봇입니다. 컨텍스트 기반으로만 답하세요."},
@@ -1653,7 +1545,6 @@ elif menu_val == "내고객 분석하기":
                             max_tokens=1200,
                             temperature=0.2,
                         )
-                        # ✅ 답변 끝에 모델명 붙여주기
                         final_ans = f"{ans}\n\n_(Generated by **{used_model}**)_"
                         st.session_state["chat_messages"].append({"role": "assistant", "content": final_ans})
                     except Exception as e:
