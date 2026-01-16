@@ -783,7 +783,7 @@ def login_gate():
     st.title("🔐 로그인")
     
     emp_input = st.text_input("사번", value="", placeholder="예: 2855")
-    dob_input = st.text_input("생년월일(YYMMDD)", value="", placeholder="예: 910518", type="password")
+    dob_input = st.text_input("생년월일(YYMMDD)", value="", placeholder="예: 910417", type="password")
     
     col1, col2 = st.columns([1, 1])
     with col1:
@@ -794,7 +794,7 @@ def login_gate():
             user_role = None
             
             # 1. 관리자 확인
-            if emp_clean == "2855" and dob_clean == "910517":
+            if emp_clean == "2855" and dob_clean == "910518":
                 user_role = "admin"
             # 2. Secrets 사용자 확인
             else:
