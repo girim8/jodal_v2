@@ -1617,7 +1617,7 @@ elif menu_val == "내고객 분석하기":
                     if st.button("👁️ OCR 상세분석 (30초 이상)", use_container_width=True):
                         run_analysis = True
                         use_ocr_flag = True
-                        target_models = ["gemini-3-flash-preview", "gemini-2.0-flash-exp"]
+                        target_models = ["gemini-3-pro-preview", "gemini-2.0-flash-exp"]
                 if run_analysis:
                     if not src_files:
                         st.warning("먼저 분석할 파일을 업로드하세요.")
@@ -1733,7 +1733,7 @@ elif menu_val == "내고객 분석하기":
                 # ===== 컨텍스트 챗봇 =====
                 st.markdown("---")
                 st.subheader("💬 보고서/테이블 참조 챗봇")
-                question = st.chat_input("질문을 입력하세요")
+                question = st.chat_input("질문을 입력하세요(사내비 등 보안상 민감한 정보는 기입하지 마세요)")
                 if question:
                     st.session_state.setdefault("chat_messages", [])
                     st.session_state["chat_messages"].append({"role": "user", "content": question})
