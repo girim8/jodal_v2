@@ -1,8 +1,7 @@
 # -*- coding: utf-8 -*-
-# app.py — Streamlit Cloud 단일 파일 통합본 (Updated: Dual Analysis Buttons & Model Debugger)
-# - Features: Upstage API for HWP, Multi-Key Rotation, Robust Auth
-# - Logic: Split Buttons (Fast vs OCR) -> Try Gemini -> Local Fallback
-# - Fixes: Explicit 3.0 Error Warning, Button Split, Debug Tool
+# app.py — Streamlit Cloud 단일 파일 통합본 (Full Version)
+# - Features: Upstage OCR (Expanded Exts), 3-Level Analysis Buttons, Full CSS/Dicts
+# - Logic: Split Buttons (Flash 2.0 / Flash 3.0 / Upstage OCR) -> Gemini -> Local Fallback
 
 import os
 import re
@@ -35,10 +34,10 @@ from xml.etree import ElementTree
 import olefile
 
 # =============================
-# 전역 설정 (모델 우선순위 관리)
+# 전역 설정 (기본 모델 우선순위)
 # =============================
-# ✅ 모델 우선순위 리스트 (3.0 Preview 우선 시도 -> 실패 시 2.0 Exp 전환)
-MODEL_PRIORITY = ["gemini-3-flash-preview", "gemini-2.0-flash-exp"]
+# ※ 버튼 클릭 시 이 순서가 동적으로 변경됨
+MODEL_PRIORITY = ["gemini-3.0-flash-preview", "gemini-2.0-flash-exp"]
 
 st.set_page_config(page_title="조달입찰 분석 시스템", layout="wide", initial_sidebar_state="expanded")
 st.markdown(
@@ -67,6 +66,7 @@ for k, v in {
     "role": None,
     "svc_filter_seed": ["전용회선", "전화", "인터넷"],
     "uploaded_file_obj": None,
+    "generated_src_pdfs": [],
 }.items():
     if k not in st.session_state:
         st.session_state[k] = v
@@ -203,9 +203,12 @@ def call_gemini(messages, temperature=0.4, max_tokens=2000):
     contents = _gemini_messages_to_contents(safe_messages)
 
     last_exception = None
+    
+    # 전역 변수 MODEL_PRIORITY 참조 (버튼에 따라 변경됨)
+    current_models = MODEL_PRIORITY 
 
     # 🔄 [스마트 폴백 루프] 모델 우선순위대로 순회
-    for model in MODEL_PRIORITY:
+    for model in current_models:
         # 키 로테이션
         for current_key in key_list:
             url = f"{GEMINI_API_BASE}/{model}:generateContent"
@@ -241,15 +244,14 @@ def call_gemini(messages, temperature=0.4, max_tokens=2000):
                 code = e.response.status_code
                 last_exception = e
                 
-                # 🛑 [수정됨] 404(Not Found) or 400(Bad Request) Handling
-                # Google Cloud 정책/리전에 따라 3.0이 없을 수 있음. 사용자에게 명시적 경고.
+                # 🛑 404/400: 모델 미지원 -> 다음 모델로 Fallback
                 if code in [404, 400]:
                     warn_msg = f"⚠️ [{model}] 호출 실패 (Code {code}): 이 모델은 현재 리전/프로젝트에서 사용할 수 없습니다. 하위 모델로 전환합니다."
-                    print(warn_msg) # 터미널 로그
-                    st.warning(warn_msg) # 화면 경고
-                    break # 키 루프 탈출 -> 다음 모델(2.0 등)로 Fallback
+                    print(warn_msg)
+                    st.warning(warn_msg)
+                    break # 키 루프 탈출 -> 다음 모델로
                 
-                # 🛑 429(Quota): 쿼터 초과 -> 같은 모델의 다른 키 시도
+                # 🛑 429: 쿼터 초과 -> 같은 모델 다른 키 시도
                 if code == 429:
                     time.sleep(1) 
                     continue
@@ -262,11 +264,11 @@ def call_gemini(messages, temperature=0.4, max_tokens=2000):
                 continue # 다음 키 시도
 
     # 모든 모델, 모든 키 다 실패했을 때
-    raise Exception(f"모든 모델({MODEL_PRIORITY}) 시도 실패. Last Error: {last_exception}")
+    raise Exception(f"모든 모델({current_models}) 시도 실패. Last Error: {last_exception}")
 
 
 # =============================
-# ✅ Upstage API 텍스트 추출 (신규 추가)
+# ✅ Upstage API 텍스트 추출
 # =============================
 def upstage_try_extract(file_bytes: bytes, filename: str) -> str | None:
     """
@@ -284,13 +286,10 @@ def upstage_try_extract(file_bytes: bytes, filename: str) -> str | None:
         files = {"document": (filename, file_bytes)}
         
         # "ocr" 옵션 등은 필요 시 payload로 추가 가능하나 기본 호출 사용
-        response = requests.post(url, headers=headers, files=files, timeout=50)
+        response = requests.post(url, headers=headers, files=files, timeout=60)
         
         if response.status_code == 200:
             result = response.json()
-            # Upstage는 주로 'content' 안에 'html'이나 'markdown' 등을 줌.
-            # 가장 원문에 가까운 텍스트를 반환한다고 가정 (보통 'content' > 'text' or 'html')
-            # API 스펙에 따라 content -> html 을 줄 수도 있음.
             content = result.get("content", {})
             
             # Markdown이 있으면 최우선
@@ -302,7 +301,6 @@ def upstage_try_extract(file_bytes: bytes, filename: str) -> str | None:
             if len(text) > 50:
                 return _redact_secrets(text)
     except Exception as e:
-        # 실패하면 None 반환하여 기존 로직으로 넘김
         print(f"[Upstage Error] {filename}: {e}")
         pass
     
@@ -378,7 +376,9 @@ def gemini_try_extract_text_from_file(
     }
 
     # 🔄 [스마트 폴백 루프] 파일 추출도 모델 우선순위 적용
-    for model in MODEL_PRIORITY:
+    current_models = MODEL_PRIORITY
+    
+    for model in current_models:
         for current_key in key_list:
             url = f"{GEMINI_API_BASE}/{model}:generateContent"
             headers = {"Content-Type": "application/json", "X-goog-api-key": current_key}
@@ -631,7 +631,7 @@ def markdown_to_pdf_korean(md_text: str, title: str | None = None):
         return None, f"PDF 생성 실패: {e}"
 
 # =============================
-# ✅ 서비스구분 컬럼 생성
+# ✅ 서비스구분 컬럼 생성 (전체 딕셔너리 복구)
 # =============================
 classification_rules = {
     '통신': '전용회선', '회선': '전용회선', '전송': '전용회선', '망': '전용회선',
@@ -693,7 +693,7 @@ def add_service_category(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # =============================
-# 첨부 링크 매트릭스
+# 첨부 링크 매트릭스 (CSS 포함)
 # =============================
 CSS_COMPACT = """
 <style>
@@ -932,9 +932,7 @@ def render_sidebar_base():
         else:
             st.sidebar.warning("⚠️ Gemini 키가 없습니다.")
             
-    # =========================================================
-    # [수정] 디버깅 도구 (관리자만 보임) + requests 방식
-    # =========================================================
+    # ===== 디버깅 도구 (관리자 전용 / requests 방식) =====
     if st.session_state.get("role") == "admin":
         st.sidebar.markdown("---")
         st.sidebar.subheader("🛠️ 디버깅 도구")
@@ -950,9 +948,6 @@ def render_sidebar_base():
                     st.sidebar.error("API 키가 없습니다.")
                 else:
                     # 2. 모델 조회 (REST API 사용 - 라이브러리 설치 불필요)
-                    import requests # 혹시 상단에 import 안 되어 있을 경우를 대비해 안전하게
-                    
-                    # 키가 여러 개면 첫 번째 키만 테스트
                     test_key = chk_key.split(",")[0].strip()
                     url = f"https://generativelanguage.googleapis.com/v1beta/models?key={test_key}"
                     
@@ -963,9 +958,7 @@ def render_sidebar_base():
                         models = data.get("models", [])
                         valid_models = []
                         for m in models:
-                            # 'generateContent' 메서드를 지원하는 모델만 필터링
                             if "generateContent" in m.get("supportedGenerationMethods", []):
-                                # "models/" 접두사 제거하고 이름만 추출
                                 m_name = m.get("name", "").replace("models/", "")
                                 valid_models.append(m_name)
                         
@@ -976,6 +969,7 @@ def render_sidebar_base():
 
             except Exception as e:
                 st.sidebar.error(f"오류 발생: {e}")
+
 
 def render_sidebar_filters(df: pd.DataFrame):
     st.sidebar.markdown("---")
@@ -1210,7 +1204,6 @@ def render_basic_analysis_charts(base_df: pd.DataFrame):
             
             if col_urgent:
                 # 데이터 전처리: 결측치 및 공백 처리
-                # Y, N, ""(공백), NaN 등을 모두 처리
                 s_urgent = dwin[col_urgent].fillna("미입력").astype(str).str.strip()
                 s_urgent = s_urgent.replace({"": "미입력", "nan": "미입력"})
                 
@@ -1404,39 +1397,48 @@ def render_basic_analysis_charts(base_df: pd.DataFrame):
 
 
 # =============================
-# LLM 분석용 텍스트 추출 (Updated: Button-Specific Upstage)
+# LLM 분석용 텍스트 추출 (Updated: Button-Specific Upstage & Expanded Exts)
 # =============================
-TEXT_EXTS = {".txt", ".csv", ".md", ".log"}
-DIRECT_PDF_EXTS = {".pdf"}
-BINARY_EXTS = {".hwp", ".hwpx", ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx"}
-
-
 def extract_text_combo_gemini_first(uploaded_files, use_upstage=True):
     combined_texts, convert_logs = [], []
+    
+    # ✅ Upstage로 처리할 확장자 (요청사항 반영)
+    UPSTAGE_TARGET_EXTS = {
+        ".hwp", ".hwpx", ".pdf", 
+        ".png", ".jpg", ".jpeg", ".tif", ".tiff", 
+        ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx"
+    }
 
     for idx, f in enumerate(uploaded_files):
         name = f.name
         data = f.read()
         ext = (os.path.splitext(name)[1] or "").lower()
 
-        # 무료 티어 429 방지용 지연 (약간)
+        # 무료 티어 429 방지용 지연
         if idx > 0:
             time.sleep(1.5)
         
-        # ✅ [Updated Logic] HWP/HWPX인 경우 버튼 선택에 따라 Upstage 시도
-        if ext in {".hwp", ".hwpx"}:
-            if use_upstage:
-                up_txt = upstage_try_extract(data, name)
-                if up_txt:
-                    convert_logs.append(f"🦋 {name}: Upstage Document Parse 성공 ({len(up_txt)}자)")
-                    combined_texts.append(f"\n\n===== [{name} | Upstage] =====\n{up_txt}\n")
-                    continue
-                else:
-                    convert_logs.append(f"ℹ️ {name}: Upstage 추출 실패 → 기존 Gemini/Local 로직으로 이동")
+        # ---------------------------------------------------------
+        # 1. [최우선] Upstage OCR 시도 (버튼이 켜져있고 + 지원 포맷인 경우)
+        # ---------------------------------------------------------
+        if use_upstage and (ext in UPSTAGE_TARGET_EXTS):
+            up_txt = upstage_try_extract(data, name)
+            if up_txt:
+                convert_logs.append(f"🦋 {name}: Upstage OCR 성공 ({len(up_txt)}자)")
+                combined_texts.append(f"\n\n===== [{name} | Upstage OCR] =====\n{up_txt}\n")
+                continue # 성공하면 다음 파일로
             else:
-                convert_logs.append(f"⏭️ {name}: 신속분석 모드 (Upstage 건너뜀) → Gemini/Local 시도")
+                convert_logs.append(f"ℹ️ {name}: Upstage 실패/키 없음 → Gemini/Local 로직으로 이동")
+        elif use_upstage and (ext not in UPSTAGE_TARGET_EXTS):
+            convert_logs.append(f"ℹ️ {name}: Upstage 미지원 포맷 → Gemini/Local 로직으로 이동")
+        else:
+            # 신속 모드인 경우 로그
+            if ext in UPSTAGE_TARGET_EXTS:
+                convert_logs.append(f"⏭️ {name}: 신속 모드 (Upstage 생략) → Gemini/Local 시도")
 
+        # ---------------------------------------------------------
         # 2. Gemini 직접 추출 시도 (바이너리/이미지 포함)
+        # ---------------------------------------------------------
         gem_txt, used_model = gemini_try_extract_text_from_file(data, name)
         
         if gem_txt:
@@ -1446,7 +1448,10 @@ def extract_text_combo_gemini_first(uploaded_files, use_upstage=True):
         else:
             convert_logs.append(f"🤖 {name}: Gemini 추출 실패 → 로컬 폴백 진행")
 
-        # 3. 로컬 라이브러리 폴백
+        # ---------------------------------------------------------
+        # 3. 로컬 라이브러리 폴백 (PyPDF2, olefile 등)
+        # ---------------------------------------------------------
+        # 3-1. HWP/HWPX
         if ext in {".hwp", ".hwpx"}:
             try:
                 txt, fmt = convert_to_text(data, name)
@@ -1456,7 +1461,8 @@ def extract_text_combo_gemini_first(uploaded_files, use_upstage=True):
             except Exception as e:
                 convert_logs.append(f"📄 {name}: 로컬 HWP/HWPX 추출 실패 ({e}) → 실패")
 
-        if ext in TEXT_EXTS:
+        # 3-2. 일반 텍스트
+        if ext in {".txt", ".csv", ".md", ".log"}:
             for enc in ("utf-8-sig", "utf-8", "cp949", "euc-kr"):
                 try:
                     txt = data.decode(enc)
@@ -1470,14 +1476,15 @@ def extract_text_combo_gemini_first(uploaded_files, use_upstage=True):
             combined_texts.append(f"\n\n===== [{name}] =====\n{_redact_secrets(txt)}\n")
             continue
 
-        if ext in DIRECT_PDF_EXTS:
+        # 3-3. PDF (PyPDF2)
+        if ext == ".pdf":
             txt = extract_text_from_pdf_bytes(data)
             convert_logs.append(f"✅ {name}: 로컬 PDF 텍스트 추출 {len(txt)} chars")
             combined_texts.append(f"\n\n===== [{name}] =====\n{_redact_secrets(txt)}\n")
             continue
             
-        # CloudConvert 제거됨 -> 미지원 형식 로그만 남김
-        if ext in BINARY_EXTS:
+        # 3-4. 기타 바이너리
+        if ext in {".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx"}:
             convert_logs.append(f"ℹ️ {name}: 바이너리 직접 추출 실패 (Gemini가 읽지 못함)")
             continue
 
@@ -1564,51 +1571,72 @@ elif menu_val == "내고객 분석하기":
                                 )
                             )
                 
-                # ===== 고객 분석 결과 그래프 (수정됨) =====
+                # ===== 고객 분석 결과 그래프 =====
                 st.markdown("---")
                 st.subheader("📊 고객사별 통계 분석 (검색된 데이터 기준)")
-                # ✅ 수정됨: expanded=False로 기본적으로 닫혀있음
                 with st.expander("차트 보기 (클릭하여 열기)", expanded=False):
                     render_basic_analysis_charts(result)
 
                 # =========================================================
-                # [수정 시작] Gemini 분석 섹션 (버튼 분리 적용)
+                # [수정 시작] Gemini 분석 섹션 (3버튼 분리 + 모델 지정)
                 # =========================================================
                 st.markdown("---")
                 st.subheader("🤖 Gemini 분석")
 
                 src_files = st.file_uploader(
                     "분석할 파일 업로드 (여러 개 가능)",
-                    type=["pdf", "hwp", "hwpx", "doc", "docx", "ppt", "pptx", "xls", "xlsx", "txt", "csv", "md", "log"],
+                    type=["pdf", "hwp", "hwpx", "doc", "docx", "ppt", "pptx", "xls", "xlsx", "txt", "csv", "md", "log", "png", "jpg", "jpeg", "tif", "tiff"],
                     accept_multiple_files=True,
                     key="src_files_uploader",
                 )
 
-                # ✅ 버튼 분리: 신속분석 vs 상세분석
-                col_btn1, col_btn2 = st.columns(2)
+                # ✅ 버튼 3개 분리
+                col_btn1, col_btn2, col_btn3 = st.columns(3)
                 
+                # 상태 변수 초기화
                 run_analysis = False
                 use_ocr_flag = False
+                target_models = []
 
+                # 1. 초신속 (2.0-flash-exp 강제)
                 with col_btn1:
-                    # 신속 분석: OCR 미사용 (False)
-                    if st.button("🚀 신속분석 (10초 이내)", use_container_width=True, type="primary"):
+                    if st.button("⚡ 초신속 (10초 이내)", use_container_width=True):
                         run_analysis = True
                         use_ocr_flag = False
+                        target_models = ["gemini-2.0-flash-exp"]
                         
+                # 2. 신속 (3.0-flash-preview 강제)
                 with col_btn2:
-                    # 상세 분석: OCR 사용 (True)
-                    if st.button("👁️ OCR 활용 상세분석 (30초 이상)", use_container_width=True):
+                    if st.button("🚀 신속 (30초 이내)", use_container_width=True, type="primary"):
+                        run_analysis = True
+                        use_ocr_flag = False
+                        target_models = ["gemini-3.0-flash-preview"]
+
+                # 3. OCR 상세 (Upstage + 3.0우선 Fallback)
+                with col_btn3:
+                    if st.button("👁️ OCR 상세분석 (30초 이상)", use_container_width=True):
                         run_analysis = True
                         use_ocr_flag = True
+                        target_models = ["gemini-3.0-flash-preview", "gemini-2.0-flash-exp"]
 
                 if run_analysis:
                     if not src_files:
                         st.warning("먼저 분석할 파일을 업로드하세요.")
                     else:
-                        mode_label = "OCR 활용 상세분석" if use_ocr_flag else "신속분석"
-                        with st.spinner(f"Gemini가 업로드된 자료로 보고서를 작성 중... ({mode_label})"):
-                            # ✅ use_upstage 파라미터 전달
+                        # 🚨 [중요] 전역 모델 우선순위를 버튼 선택값으로 덮어씌움
+                        global MODEL_PRIORITY
+                        MODEL_PRIORITY = target_models
+
+                        # 모드 라벨링
+                        if use_ocr_flag:
+                            mode_label = "OCR 상세분석"
+                        elif "2.0" in target_models[0]:
+                            mode_label = "초신속(Gemini 2.0)"
+                        else:
+                            mode_label = "신속(Gemini 3.0)"
+
+                        with st.spinner(f"Gemini가 보고서를 작성 중... ({mode_label})"):
+                            # 1. 텍스트 추출 (Upstage 여부 적용)
                             combined_text, logs, _ = extract_text_combo_gemini_first(src_files, use_upstage=use_ocr_flag)
 
                             st.session_state["gpt_convert_logs"] = logs
@@ -1640,21 +1668,20 @@ elif menu_val == "내고객 분석하기":
 {combined_text[:180000]}
 """.strip()
                                 try:
-                                    # Gemini 호출
+                                    # 2. Gemini 호출 (위에서 설정한 MODEL_PRIORITY가 적용됨)
                                     report, used_model = call_gemini(
                                         [
                                             {"role": "system", "content": "당신은 SK브로드밴드 망설계/조달 제안 컨설턴트입니다."},
                                             {"role": "user", "content": prompt},
                                         ],
-                                        max_tokens=4000, # 요약표 포함 위해 토큰 증량
+                                        max_tokens=4000,
                                         temperature=0.3,
                                     )
 
                                     st.session_state["gpt_report_md"] = report
-                                    # PDF 생성 로직 제거되었으므로 리스트 비움
-                                    st.session_state["generated_src_pdfs"] = []
+                                    st.session_state["generated_src_pdfs"] = [] # 초기화
 
-                                    st.success(f"보고서 생성이 완료되었습니다. (사용된 모델: **{used_model}**, 모드: {mode_label})")
+                                    st.success(f"보고서 생성이 완료되었습니다. (모델: **{used_model}**, 모드: {mode_label})")
 
                                 except Exception as e:
                                     st.error(f"보고서 생성 중 오류: {e}")
@@ -1671,12 +1698,11 @@ elif menu_val == "내고객 분석하기":
                     st.markdown("### 📝 Gemini 분석 보고서")
                     st.markdown(report_md)
                     
-                    # 파일명 자동 생성 (Regex 수정됨)
+                    # 파일명 자동 생성
                     report_title = "Gemini_Analysis_Report"
                     match = re.search(r"^#\s+(.*)", report_md, re.MULTILINE)
                     if match:
                         raw_title = match.group(1).strip()
-                        # 하이픈을 대괄호 맨 뒤로 이동하여 범위 오류 방지
                         safe_title = re.sub(r"[^\w\s가-힣-]", "_", raw_title)
                         report_title = re.sub(r"\s+", "_", safe_title)
                     
