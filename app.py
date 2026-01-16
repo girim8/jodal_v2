@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
-# app.py — Streamlit Cloud 단일 파일 통합본 (Fix: NameError Resolved)
-# - Features: Multi-Key Rotation, Sidebar Key Priority, Robust Auth
-# - Logic: Try gemini-3.0-flash-preview -> Auto Fallback to gemini-2.0-flash-exp
-# - Fixes: Removed undefined 'CURRENT_MODEL_NAME', 404 Handling, Regex
+# app.py — Streamlit Cloud 단일 파일 통합본 (Updated: Upstage HWP & Gemini 3.0 Warning)
+# - Features: Upstage API for HWP, Multi-Key Rotation, Robust Auth
+# - Logic: Try Upstage(HWP) -> Try Gemini -> Local Fallback
+# - Fixes: Explicit 3.0 Error Warning
 
 import os
 import re
@@ -33,7 +33,6 @@ import zipfile
 import zlib
 from xml.etree import ElementTree
 import olefile
-
 
 # =============================
 # 전역 설정 (모델 우선순위 관리)
@@ -81,8 +80,9 @@ def _redact_secrets(text: str) -> str:
         return text
     text = re.sub(r"sk-[A-Za-z0-9_\-]{20,}", "[REDACTED_KEY]", text)
     text = re.sub(r"AIza[0-9A-Za-z\-_]{20,}", "[REDACTED_GEMINI_KEY]", text)
+    text = re.sub(r"up_[A-Za-z0-9]{20,}", "[REDACTED_UPSTAGE_KEY]", text)
     text = re.sub(
-        r'(?i)\b(gpt_api_key|OPENAI_API_KEY|GEMINI_API_KEY)\s*=\s*([\'\"]).*?\2',
+        r'(?i)\b(gpt_api_key|OPENAI_API_KEY|GEMINI_API_KEY|UPSTAGE_API_KEY)\s*=\s*([\'\"]).*?\2',
         r'\1=\2[REDACTED]\2',
         text,
     )
@@ -118,6 +118,19 @@ def _get_gemini_key_from_secrets() -> str | None:
         key = st.secrets.get("GEMINI_API_KEY") if "GEMINI_API_KEY" in st.secrets else None
         if key and str(key).strip():
             return str(key).strip()
+    except Exception:
+        pass
+    return None
+
+def _get_upstage_key_from_secrets() -> str | None:
+    try:
+        key = st.secrets.get("UPSTAGE_API_KEY") if "UPSTAGE_API_KEY" in st.secrets else None
+        if key and str(key).strip():
+            return str(key).strip()
+        # 환경변수 폴백
+        env_key = os.environ.get("UPSTAGE_API_KEY")
+        if env_key:
+            return env_key
     except Exception:
         pass
     return None
@@ -170,8 +183,7 @@ def _gemini_messages_to_contents(messages):
 
 def call_gemini(messages, temperature=0.4, max_tokens=2000):
     """
-    Gemini API 호출 함수 (Smart Fallback Logic)
-    MODEL_PRIORITY 리스트 순서대로 시도합니다.
+    Gemini API 호출 함수 (Smart Fallback Logic + Error Warning)
     """
     key_list = _get_gemini_key_list()
     if not key_list:
@@ -215,23 +227,27 @@ def call_gemini(messages, temperature=0.4, max_tokens=2000):
                 candidates = data.get("candidates", [])
                 if not candidates:
                     if data.get("promptFeedback"):
-                        # 차단된 경우, 이 모델/키 조합은 실패 처리
+                        # 차단된 경우
                         raise Exception(f"Prompt Feedback Blocked: {data['promptFeedback']}")
                     raise Exception(f"응답 없음 (candidates Empty): {data}")
                 
                 parts = candidates[0]["content"]["parts"]
                 text = "\n".join([p.get("text", "") for p in parts]).strip()
                 
-                # ✅ 성공 시 반환 (사용된 모델명도 함께 반환)
+                # ✅ 성공 시 반환
                 return text, model
 
             except requests.exceptions.HTTPError as e:
                 code = e.response.status_code
                 last_exception = e
                 
-                # 🛑 404(Not Found) or 400: 모델이 아직 없거나 주소 오류 -> 이 모델 포기하고 다음 모델(2.0)로 이동
+                # 🛑 [수정됨] 404(Not Found) or 400(Bad Request) Handling
+                # Google Cloud 정책/리전에 따라 3.0이 없을 수 있음. 사용자에게 명시적 경고.
                 if code in [404, 400]:
-                    break # 키 루프 탈출 -> 다음 모델 루프로 진입
+                    warn_msg = f"⚠️ [{model}] 호출 실패 (Code {code}): 이 모델은 현재 리전/프로젝트에서 사용할 수 없습니다. 하위 모델로 전환합니다."
+                    print(warn_msg) # 터미널 로그
+                    st.warning(warn_msg) # 화면 경고
+                    break # 키 루프 탈출 -> 다음 모델(2.0 등)로 Fallback
                 
                 # 🛑 429(Quota): 쿼터 초과 -> 같은 모델의 다른 키 시도
                 if code == 429:
@@ -247,6 +263,50 @@ def call_gemini(messages, temperature=0.4, max_tokens=2000):
 
     # 모든 모델, 모든 키 다 실패했을 때
     raise Exception(f"모든 모델({MODEL_PRIORITY}) 시도 실패. Last Error: {last_exception}")
+
+
+# =============================
+# ✅ Upstage API 텍스트 추출 (신규 추가)
+# =============================
+def upstage_try_extract(file_bytes: bytes, filename: str) -> str | None:
+    """
+    Upstage Document Parse API를 사용하여 문서 텍스트를 추출합니다.
+    """
+    api_key = _get_upstage_key_from_secrets()
+    if not api_key:
+        return None
+
+    try:
+        url = "https://api.upstage.ai/v1/document-ai/document-parse"
+        headers = {"Authorization": f"Bearer {api_key}"}
+        
+        # Multipart Upload
+        files = {"document": (filename, file_bytes)}
+        
+        # "ocr" 옵션 등은 필요 시 payload로 추가 가능하나 기본 호출 사용
+        response = requests.post(url, headers=headers, files=files, timeout=50)
+        
+        if response.status_code == 200:
+            result = response.json()
+            # Upstage는 주로 'content' 안에 'html'이나 'markdown' 등을 줌.
+            # 가장 원문에 가까운 텍스트를 반환한다고 가정 (보통 'content' > 'text' or 'html')
+            # API 스펙에 따라 content -> html 을 줄 수도 있음.
+            content = result.get("content", {})
+            
+            # Markdown이 있으면 최우선
+            if isinstance(content, dict):
+                text = content.get("markdown") or content.get("text") or content.get("html") or ""
+            else:
+                text = str(content) # 구형 응답 대비
+                
+            if len(text) > 50:
+                return _redact_secrets(text)
+    except Exception as e:
+        # 실패하면 None 반환하여 기존 로직으로 넘김
+        print(f"[Upstage Error] {filename}: {e}")
+        pass
+    
+    return None
 
 
 # =============================
@@ -343,7 +403,8 @@ def gemini_try_extract_text_from_file(
             except requests.exceptions.HTTPError as e:
                 code = e.response.status_code
                 if code in [404, 400]:
-                    break # 이 모델은 안되므로 다음 모델로
+                    # 파일 추출에서는 UI 경고 없이 조용히 다음 모델 시도
+                    break 
                 if code == 429:
                     time.sleep(1)
                     continue
@@ -803,7 +864,7 @@ def login_gate():
     st.title("🔐 로그인")
     
     emp_input = st.text_input("사번", value="", placeholder="예: 2855")
-    dob_input = st.text_input("생년월일(YYMMDD)", value="", placeholder="예: 910518", type="password")
+    dob_input = st.text_input("생년월일(YYMMDD)", value="", placeholder="예: 910418", type="password")
     
     col1, col2 = st.columns([1, 1])
     with col1:
@@ -1299,7 +1360,7 @@ def render_basic_analysis_charts(base_df: pd.DataFrame):
 
 
 # =============================
-# LLM 분석용 텍스트 추출 (Pure Gemini + Local)
+# LLM 분석용 텍스트 추출 (Updated: Upstage First)
 # =============================
 TEXT_EXTS = {".txt", ".csv", ".md", ".log"}
 DIRECT_PDF_EXTS = {".pdf"}
@@ -1318,7 +1379,17 @@ def extract_text_combo_gemini_first(uploaded_files):
         if idx > 0:
             time.sleep(1.5)
         
-        # 1. Gemini 직접 추출 시도 (바이너리/이미지 포함)
+        # ✅ [New] 1. HWP/HWPX인 경우 Upstage 우선 시도
+        if ext in {".hwp", ".hwpx"}:
+            up_txt = upstage_try_extract(data, name)
+            if up_txt:
+                convert_logs.append(f"🦋 {name}: Upstage Document Parse 성공 ({len(up_txt)}자)")
+                combined_texts.append(f"\n\n===== [{name} | Upstage] =====\n{up_txt}\n")
+                continue
+            else:
+                convert_logs.append(f"ℹ️ {name}: Upstage 추출 실패 → 기존 Gemini/Local 로직으로 이동")
+
+        # 2. Gemini 직접 추출 시도 (바이너리/이미지 포함)
         gem_txt, used_model = gemini_try_extract_text_from_file(data, name)
         
         if gem_txt:
@@ -1328,7 +1399,7 @@ def extract_text_combo_gemini_first(uploaded_files):
         else:
             convert_logs.append(f"🤖 {name}: Gemini 추출 실패 → 로컬 폴백 진행")
 
-        # 2. 로컬 라이브러리 폴백
+        # 3. 로컬 라이브러리 폴백
         if ext in {".hwp", ".hwpx"}:
             try:
                 txt, fmt = convert_to_text(data, name)
