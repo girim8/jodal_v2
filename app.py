@@ -794,7 +794,7 @@ def login_gate():
             user_role = None
             
             # 1. 관리자 확인
-            if emp_clean == "2855" and dob_clean == "910518":
+            if emp_clean == "2855" and dob_clean == "910517":
                 user_role = "admin"
             # 2. Secrets 사용자 확인
             else:
