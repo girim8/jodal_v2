@@ -1598,26 +1598,26 @@ elif menu_val == "내고객 분석하기":
                 use_ocr_flag = False
                 target_models = []
 
-                # 1. 초신속 (2.0-flash-exp 강제)
+                # 1. 초신속 
                 with col_btn1:
                     if st.button("⚡ 초신속 (10초 이내)", use_container_width=True):
                         run_analysis = True
                         use_ocr_flag = False
                         target_models = ["gemini-2.0-flash-exp"]
                         
-                # 2. 신속 (3.0-flash-preview 강제)
+                # 2. 신속 
                 with col_btn2:
                     if st.button("🚀 신속 (30초 이내)", use_container_width=True, type="primary"):
                         run_analysis = True
                         use_ocr_flag = False
-                        target_models = ["gemini-3.0-flash-preview"]
+                        target_models = ["gemini-3-flash-preview"]
 
                 # 3. OCR 상세 (Upstage + 3.0우선 Fallback)
                 with col_btn3:
                     if st.button("👁️ OCR 상세분석 (30초 이상)", use_container_width=True):
                         run_analysis = True
                         use_ocr_flag = True
-                        target_models = ["gemini-3.0-flash-preview", "gemini-2.0-flash-exp"]
+                        target_models = ["gemini-3-flash-preview", "gemini-2.0-flash-exp"]
                 if run_analysis:
                     if not src_files:
                         st.warning("먼저 분석할 파일을 업로드하세요.")
