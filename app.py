@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
-# app.py — Streamlit Cloud 단일 파일 통합본 (Model Name Updated)
-# - Target Model: gemini-3.0-flash-preview (Fallback to 2.0)
+# app.py — Streamlit Cloud 단일 파일 통합본 (Fix: NameError Resolved)
 # - Features: Multi-Key Rotation, Sidebar Key Priority, Robust Auth
-# - Fixes: Emergency Notice Pie Chart, Regex Error, No CloudConvert
+# - Logic: Try gemini-3.0-flash-preview -> Auto Fallback to gemini-2.0-flash-exp
+# - Fixes: Removed undefined 'CURRENT_MODEL_NAME', 404 Handling, Regex
 
 import os
 import re
@@ -38,8 +38,7 @@ import olefile
 # =============================
 # 전역 설정 (모델 우선순위 관리)
 # =============================
-# ✅ 요청하신 대로 호출명을 'gemini-3.0-flash-preview'로 변경했습니다.
-# 1순위로 시도하고, 실패 시 2순위(2.0)로 자동 전환됩니다.
+# ✅ 모델 우선순위 리스트 (3.0 Preview 우선 시도 -> 실패 시 2.0 Exp 전환)
 MODEL_PRIORITY = ["gemini-3.0-flash-preview", "gemini-2.0-flash-exp"]
 
 st.set_page_config(page_title="조달입찰 분석 시스템", layout="wide", initial_sidebar_state="expanded")
@@ -804,7 +803,7 @@ def login_gate():
     st.title("🔐 로그인")
     
     emp_input = st.text_input("사번", value="", placeholder="예: 2855")
-    dob_input = st.text_input("생년월일(YYMMDD)", value="", placeholder="예: 910417", type="password")
+    dob_input = st.text_input("생년월일(YYMMDD)", value="", placeholder="예: 910518", type="password")
     
     col1, col2 = st.columns([1, 1])
     with col1:
@@ -1507,7 +1506,6 @@ elif menu_val == "내고객 분석하기":
                                             {"role": "system", "content": "당신은 SK브로드밴드 망설계/조달 제안 컨설턴트입니다."},
                                             {"role": "user", "content": prompt},
                                         ],
-                                        model=CURRENT_MODEL_NAME,
                                         max_tokens=4000, # 요약표 포함 위해 토큰 증량
                                         temperature=0.3,
                                     )
@@ -1592,7 +1590,6 @@ elif menu_val == "내고객 분석하기":
                                 {"role": "system", "content": "당신은 조달/통신 제안 분석 챗봇입니다. 컨텍스트 기반으로만 답하세요."},
                                 {"role": "user", "content": q_prompt},
                             ],
-                            model=CURRENT_MODEL_NAME,
                             max_tokens=1200,
                             temperature=0.2,
                         )
