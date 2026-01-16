@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
-# app.py — Streamlit Cloud 단일 파일 통합본 (Gemini 3.0 Ready)
+# app.py — Streamlit Cloud 단일 파일 통합본 (Model Name Updated)
+# - Target Model: gemini-3.0-flash-preview (Fallback to 2.0)
 # - Features: Multi-Key Rotation, Sidebar Key Priority, Robust Auth
-# - Model: gemini-3.0-flash (Global Variable Controlled)
 # - Fixes: Emergency Notice Pie Chart, Regex Error, No CloudConvert
 
 import os
@@ -36,10 +36,11 @@ import olefile
 
 
 # =============================
-# 전역 설정 (모델명 관리)
+# 전역 설정 (모델 우선순위 관리)
 # =============================
-# ✅ 사용할 모델명을 여기서 한 번만 설정하면 전체 코드에 적용됩니다.
-CURRENT_MODEL_NAME = "gemini-3.0-flash" 
+# ✅ 요청하신 대로 호출명을 'gemini-3.0-flash-preview'로 변경했습니다.
+# 1순위로 시도하고, 실패 시 2순위(2.0)로 자동 전환됩니다.
+MODEL_PRIORITY = ["gemini-3.0-flash-preview", "gemini-2.0-flash-exp"]
 
 st.set_page_config(page_title="조달입찰 분석 시스템", layout="wide", initial_sidebar_state="expanded")
 st.markdown(
@@ -168,10 +169,10 @@ def _gemini_messages_to_contents(messages):
     return contents
 
 
-def call_gemini(messages, temperature=0.4, max_tokens=2000, model=CURRENT_MODEL_NAME):
+def call_gemini(messages, temperature=0.4, max_tokens=2000):
     """
-    Gemini API 호출 함수
-    Default Model: CURRENT_MODEL_NAME (gemini-3.0-flash)
+    Gemini API 호출 함수 (Smart Fallback Logic)
+    MODEL_PRIORITY 리스트 순서대로 시도합니다.
     """
     key_list = _get_gemini_key_list()
     if not key_list:
@@ -192,45 +193,61 @@ def call_gemini(messages, temperature=0.4, max_tokens=2000, model=CURRENT_MODEL_
 
     last_exception = None
 
-    for current_key in key_list:
-        url = f"{GEMINI_API_BASE}/{model}:generateContent"
-        headers = {"Content-Type": "application/json", "X-goog-api-key": current_key}
-        
-        payload = {
-            "contents": contents,
-            "generationConfig": {
-                "temperature": float(temperature),
-                "maxOutputTokens": int(max_tokens),
+    # 🔄 [스마트 폴백 루프] 모델 우선순위대로 순회
+    for model in MODEL_PRIORITY:
+        # 키 로테이션
+        for current_key in key_list:
+            url = f"{GEMINI_API_BASE}/{model}:generateContent"
+            headers = {"Content-Type": "application/json", "X-goog-api-key": current_key}
+            
+            payload = {
+                "contents": contents,
+                "generationConfig": {
+                    "temperature": float(temperature),
+                    "maxOutputTokens": int(max_tokens),
+                }
             }
-        }
 
-        try:
-            r = requests.post(url, headers=headers, data=json.dumps(payload), timeout=60)
-            r.raise_for_status()
-            data = r.json()
-            
-            candidates = data.get("candidates", [])
-            if not candidates:
-                if data.get("promptFeedback"):
-                    return f"[차단됨] 피드백: {data['promptFeedback']}", model
-                raise Exception(f"응답 없음 (candidates Empty): {data}")
-            
-            parts = candidates[0]["content"]["parts"]
-            text = "\n".join([p.get("text", "") for p in parts]).strip()
-            return text, model
+            try:
+                r = requests.post(url, headers=headers, data=json.dumps(payload), timeout=60)
+                r.raise_for_status()
+                data = r.json()
+                
+                candidates = data.get("candidates", [])
+                if not candidates:
+                    if data.get("promptFeedback"):
+                        # 차단된 경우, 이 모델/키 조합은 실패 처리
+                        raise Exception(f"Prompt Feedback Blocked: {data['promptFeedback']}")
+                    raise Exception(f"응답 없음 (candidates Empty): {data}")
+                
+                parts = candidates[0]["content"]["parts"]
+                text = "\n".join([p.get("text", "") for p in parts]).strip()
+                
+                # ✅ 성공 시 반환 (사용된 모델명도 함께 반환)
+                return text, model
 
-        except requests.exceptions.HTTPError as e:
-            code = e.response.status_code
-            last_exception = e
-            if code in [429, 403]:
-                time.sleep(1) 
+            except requests.exceptions.HTTPError as e:
+                code = e.response.status_code
+                last_exception = e
+                
+                # 🛑 404(Not Found) or 400: 모델이 아직 없거나 주소 오류 -> 이 모델 포기하고 다음 모델(2.0)로 이동
+                if code in [404, 400]:
+                    break # 키 루프 탈출 -> 다음 모델 루프로 진입
+                
+                # 🛑 429(Quota): 쿼터 초과 -> 같은 모델의 다른 키 시도
+                if code == 429:
+                    time.sleep(1) 
+                    continue
+                
+                # 기타 에러: 다음 키 시도
                 continue
-            break
-        except Exception as e:
-            last_exception = e
-            break
+                
+            except Exception as e:
+                last_exception = e
+                continue # 다음 키 시도
 
-    raise Exception(f"모든 API 키({len(key_list)}개) 시도 실패. Last Error: {last_exception}")
+    # 모든 모델, 모든 키 다 실패했을 때
+    raise Exception(f"모든 모델({MODEL_PRIORITY}) 시도 실패. Last Error: {last_exception}")
 
 
 # =============================
@@ -264,7 +281,6 @@ def gemini_try_extract_text_from_file(
     filename: str,
     temperature: float = 0.2,
     max_tokens: int = 2048,
-    model: str = CURRENT_MODEL_NAME,
 ) -> tuple[str | None, str | None]:
     
     key_list = _get_gemini_key_list()
@@ -302,34 +318,39 @@ def gemini_try_extract_text_from_file(
         }
     }
 
-    for current_key in key_list:
-        url = f"{GEMINI_API_BASE}/{model}:generateContent"
-        headers = {"Content-Type": "application/json", "X-goog-api-key": current_key}
+    # 🔄 [스마트 폴백 루프] 파일 추출도 모델 우선순위 적용
+    for model in MODEL_PRIORITY:
+        for current_key in key_list:
+            url = f"{GEMINI_API_BASE}/{model}:generateContent"
+            headers = {"Content-Type": "application/json", "X-goog-api-key": current_key}
 
-        try:
-            r = requests.post(url, headers=headers, data=json.dumps(payload), timeout=60)
-            r.raise_for_status()
-            data = r.json()
-            
-            candidates = data.get("candidates", [])
-            if not candidates:
-                return None, None
+            try:
+                r = requests.post(url, headers=headers, data=json.dumps(payload), timeout=60)
+                r.raise_for_status()
+                data = r.json()
                 
-            parts = candidates[0]["content"]["parts"]
-            text = "\n".join([p.get("text", "") for p in parts]).strip()
-            
-            if (not text) or ("EXTRACTION_FAILED" in text) or (len(text) < 30):
-                return None, None
-            
-            return _redact_secrets(text), model
+                candidates = data.get("candidates", [])
+                if not candidates:
+                    continue 
+                    
+                parts = candidates[0]["content"]["parts"]
+                text = "\n".join([p.get("text", "") for p in parts]).strip()
+                
+                if (not text) or ("EXTRACTION_FAILED" in text) or (len(text) < 30):
+                    continue
+                
+                return _redact_secrets(text), model
 
-        except requests.exceptions.HTTPError as e:
-            if e.response.status_code == 429:
-                time.sleep(1)
+            except requests.exceptions.HTTPError as e:
+                code = e.response.status_code
+                if code in [404, 400]:
+                    break # 이 모델은 안되므로 다음 모델로
+                if code == 429:
+                    time.sleep(1)
+                    continue
                 continue
-            return None, None
-        except Exception:
-            return None, None
+            except Exception:
+                continue
 
     return None, None
 
@@ -1426,11 +1447,11 @@ elif menu_val == "내고객 분석하기":
                                 )
                             )
                 
-                # ===== 고객 분석 결과 그래프 =====
+                # ===== 고객 분석 결과 그래프 (수정됨) =====
                 st.markdown("---")
                 st.subheader("📊 고객사별 통계 분석 (검색된 데이터 기준)")
-                # ✅ 수정됨: 기본적으로 닫혀있도록 expanded=False 설정
-                with st.expander("차트 보기", expanded=False):
+                # ✅ 수정됨: expanded=False로 기본적으로 닫혀있음
+                with st.expander("차트 보기 (클릭하여 열기)", expanded=False):
                     render_basic_analysis_charts(result)
 
                 # ===== Gemini 분석 =====
