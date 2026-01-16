@@ -38,7 +38,7 @@ import olefile
 # 전역 설정 (모델 우선순위 관리)
 # =============================
 # ✅ 모델 우선순위 리스트 (3.0 Preview 우선 시도 -> 실패 시 2.0 Exp 전환)
-MODEL_PRIORITY = ["gemini-3.0-flash-preview", "gemini-2.0-flash-exp"]
+MODEL_PRIORITY = ["gemini-3-flash-preview", "gemini-2.0-flash-exp"]
 
 st.set_page_config(page_title="조달입찰 분석 시스템", layout="wide", initial_sidebar_state="expanded")
 st.markdown(
