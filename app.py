@@ -1618,13 +1618,16 @@ elif menu_val == "내고객 분석하기":
                         run_analysis = True
                         use_ocr_flag = True
                         target_models = ["gemini-3.0-flash-preview", "gemini-2.0-flash-exp"]
-
                 if run_analysis:
                     if not src_files:
                         st.warning("먼저 분석할 파일을 업로드하세요.")
                     else:
-                        # 🚨 [중요] 전역 모델 우선순위를 버튼 선택값으로 덮어씌움
-                        global MODEL_PRIORITY
+                        # =========================================================
+                        # [수정] global 키워드 삭제 (SyntaxError 해결)
+                        # =========================================================
+                        # 기존: global MODEL_PRIORITY (삭제!)
+                        
+                        # 그냥 바로 대입하면 전역 변수가 덮어씌워집니다.
                         MODEL_PRIORITY = target_models
 
                         # 모드 라벨링
@@ -1636,7 +1639,7 @@ elif menu_val == "내고객 분석하기":
                             mode_label = "신속(Gemini 3.0)"
 
                         with st.spinner(f"Gemini가 보고서를 작성 중... ({mode_label})"):
-                            # 1. 텍스트 추출 (Upstage 여부 적용)
+                            # (이하 코드는 동일)
                             combined_text, logs, _ = extract_text_combo_gemini_first(src_files, use_upstage=use_ocr_flag)
 
                             st.session_state["gpt_convert_logs"] = logs
