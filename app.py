@@ -932,33 +932,50 @@ def render_sidebar_base():
         else:
             st.sidebar.warning("⚠️ Gemini 키가 없습니다.")
             
-    # ===== 디버깅 도구 (신규 추가) =====
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("🛠️ 디버깅 도구")
-    if st.sidebar.button("내 API로 쓸 수 있는 모델 확인하기"):
-        try:
-            import google.generativeai as genai
-            # 1. 키 가져오기 (입력값 우선 -> 없으면 Secrets)
-            chk_key = st.session_state.get("user_input_gemini_key", "").strip()
-            if not chk_key:
-                chk_key = _get_gemini_key_from_secrets()
-            
-            if not chk_key:
-                st.sidebar.error("API 키가 없습니다.")
-            else:
-                # 2. 모델 조회
-                genai.configure(api_key=chk_key)
-                models = genai.list_models()
-                valid_models = []
-                for m in models:
-                    if 'generateContent' in m.supported_generation_methods:
-                        valid_models.append(m.name)
-                # 3. 결과 출력
-                st.sidebar.success("조회 성공!")
-                st.sidebar.code("\n".join(valid_models))
-        except Exception as e:
-            st.sidebar.error(f"조회 실패: {e}")
+    # =========================================================
+    # [수정] 디버깅 도구 (관리자만 보임) + requests 방식
+    # =========================================================
+    if st.session_state.get("role") == "admin":
+        st.sidebar.markdown("---")
+        st.sidebar.subheader("🛠️ 디버깅 도구")
+        
+        if st.sidebar.button("내 API로 쓸 수 있는 모델 확인하기"):
+            try:
+                # 1. 키 가져오기 (입력값 우선 -> 없으면 Secrets)
+                chk_key = st.session_state.get("user_input_gemini_key", "").strip()
+                if not chk_key:
+                    chk_key = _get_gemini_key_from_secrets()
+                
+                if not chk_key:
+                    st.sidebar.error("API 키가 없습니다.")
+                else:
+                    # 2. 모델 조회 (REST API 사용 - 라이브러리 설치 불필요)
+                    import requests # 혹시 상단에 import 안 되어 있을 경우를 대비해 안전하게
+                    
+                    # 키가 여러 개면 첫 번째 키만 테스트
+                    test_key = chk_key.split(",")[0].strip()
+                    url = f"https://generativelanguage.googleapis.com/v1beta/models?key={test_key}"
+                    
+                    response = requests.get(url, timeout=10)
+                    
+                    if response.status_code == 200:
+                        data = response.json()
+                        models = data.get("models", [])
+                        valid_models = []
+                        for m in models:
+                            # 'generateContent' 메서드를 지원하는 모델만 필터링
+                            if "generateContent" in m.get("supportedGenerationMethods", []):
+                                # "models/" 접두사 제거하고 이름만 추출
+                                m_name = m.get("name", "").replace("models/", "")
+                                valid_models.append(m_name)
+                        
+                        st.sidebar.success(f"조회 성공! ({len(valid_models)}개)")
+                        st.sidebar.code("\n".join(valid_models))
+                    else:
+                        st.sidebar.error(f"조회 실패 (HTTP {response.status_code}): {response.text}")
 
+            except Exception as e:
+                st.sidebar.error(f"오류 발생: {e}")
 
 def render_sidebar_filters(df: pd.DataFrame):
     st.sidebar.markdown("---")
