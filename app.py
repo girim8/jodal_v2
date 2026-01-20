@@ -2,6 +2,7 @@
 # app.py — Streamlit Cloud 단일 파일 통합본 (Full Version)
 # - Features: Upstage OCR (Expanded Exts), 3-Level Analysis Buttons, Full CSS/Dicts
 # - Logic: Split Buttons (Flash 2.0 / Flash 3.0 / Upstage OCR) -> Gemini -> Local Fallback
+# - Updates: DOCX Download added, Org Search display fixed
 
 import os
 import re
@@ -24,6 +25,15 @@ import plotly.express as px
 # ✅ Markdown → HTML → PDF 용
 import markdown as md_lib
 from xhtml2pdf import pisa
+
+# ✅ DOCX 생성을 위한 라이브러리 (pip install python-docx 필요)
+try:
+    from docx import Document
+    from docx.shared import Pt
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    HAS_DOCX_LIB = True
+except ImportError:
+    HAS_DOCX_LIB = False
 
 # ===== HWP/HWPX 로컬 추출용 =====
 import io
@@ -631,7 +641,98 @@ def markdown_to_pdf_korean(md_text: str, title: str | None = None):
         return None, f"PDF 생성 실패: {e}"
 
 # =============================
-# ✅ 서비스구분 컬럼 생성 (전체 딕셔너리 복구)
+# ✅ Markdown → DOCX (New Feature)
+# =============================
+def markdown_to_docx(md_text: str, title: str = "분석 보고서") -> BytesIO | None:
+    if not HAS_DOCX_LIB:
+        return None
+    
+    try:
+        doc = Document()
+        doc.add_heading(title, 0)
+        
+        # 라인 단위 파싱 (간이 파서)
+        lines = md_text.split('\n')
+        table_buffer = [] # 테이블 라인 임시 저장
+        
+        def _flush_table(buffer):
+            if not buffer: return
+            try:
+                # | Col1 | Col2 | ... 형태 가정
+                # 첫 줄은 헤더, 두번째는 구분선(|---|), 나머지는 데이터
+                rows_data = []
+                for b_line in buffer:
+                    # 양 끝의 | 제거 및 분리
+                    cells = [c.strip() for c in b_line.strip('|').split('|')]
+                    rows_data.append(cells)
+                
+                # 구분선 제거 (--- 들어있는 라인)
+                valid_rows = [r for r in rows_data if not (r and '---' in r[0])]
+                
+                if not valid_rows: return
+                
+                # 테이블 생성
+                max_cols = max(len(r) for r in valid_rows)
+                table = doc.add_table(rows=len(valid_rows), cols=max_cols)
+                table.style = 'Table Grid'
+                
+                for r_idx, row_content in enumerate(valid_rows):
+                    row_cells = table.rows[r_idx].cells
+                    for c_idx, cell_text in enumerate(row_content):
+                        if c_idx < len(row_cells):
+                            row_cells[c_idx].text = cell_text
+                
+                doc.add_paragraph("") # 테이블 뒤 공백
+            except Exception:
+                # 테이블 파싱 실패 시 그냥 텍스트로 덤프
+                for b_line in buffer:
+                    doc.add_paragraph(b_line)
+        
+        for line in lines:
+            stripped = line.strip()
+            
+            # 테이블 감지
+            if stripped.startswith('|'):
+                table_buffer.append(stripped)
+                continue
+            else:
+                if table_buffer:
+                    _flush_table(table_buffer)
+                    table_buffer = []
+            
+            # 일반 텍스트 처리
+            if not stripped:
+                continue
+            
+            if line.startswith('### '):
+                doc.add_heading(line[4:], level=3)
+            elif line.startswith('## '):
+                doc.add_heading(line[3:], level=2)
+            elif line.startswith('# '):
+                doc.add_heading(line[2:], level=1)
+            elif line.startswith('- ') or line.startswith('* '):
+                p = doc.add_paragraph(line[2:], style='List Bullet')
+            elif line.startswith('1. '):
+                p = doc.add_paragraph(line[3:], style='List Number')
+            else:
+                doc.add_paragraph(line)
+        
+        # 남은 테이블 처리
+        if table_buffer:
+            _flush_table(table_buffer)
+
+        f = BytesIO()
+        doc.save(f)
+        f.seek(0)
+        return f
+
+    except Exception as e:
+        print(f"DOCX 생성 오류: {e}")
+        return None
+
+
+# =============================
+# 서비스구분 컬럼 생성 (전체 딕셔너리 복구)
 # =============================
 classification_rules = {
     '통신': '전용회선', '회선': '전용회선', '전송': '전용회선', '망': '전용회선',
@@ -1534,7 +1635,9 @@ elif menu_val == "내고객 분석하기":
         st.write(f"총 {len(unique_orgs)}개 기관")
         search_org = st.text_input("기관명 검색", key="search_org_in_my")
         view_orgs = [o for o in unique_orgs if (search_org in str(o))] if search_org else unique_orgs
-        st.write(view_orgs[:120])
+        
+        # ✅ 따옴표/괄호 제거: 리스트 스트링이 아닌, 문자열 결합으로 표시
+        st.write(", ".join([str(o) for o in view_orgs[:120]]))
 
     if customer_input:
         customers = [c.strip() for c in customer_input.split(",") if c.strip()]
@@ -1711,24 +1814,48 @@ elif menu_val == "내고객 분석하기":
                     
                     final_filename = f"{report_title}_{datetime.now().strftime('%Y%m%d')}"
 
-                    st.download_button(
-                        "📥 보고서 다운로드 (.md)",
-                        data=report_md.encode("utf-8"),
-                        file_name=f"{final_filename}.md",
-                        mime="text/markdown",
-                        use_container_width=True
-                    )
-
-                    pdf_bytes, dbg = markdown_to_pdf_korean(report_md, title="Gemini 분석 보고서")
-                    if pdf_bytes:
+                    # 다운로드 버튼 그룹
+                    col_dl1, col_dl2, col_dl3 = st.columns(3)
+                    
+                    with col_dl1:
                         st.download_button(
-                            "📥 보고서 다운로드 (.pdf)",
-                            data=pdf_bytes,
-                            file_name=f"{final_filename}.pdf",
-                            mime="application/pdf",
+                            "📥 다운로드 (.md)",
+                            data=report_md.encode("utf-8"),
+                            file_name=f"{final_filename}.md",
+                            mime="text/markdown",
                             use_container_width=True
                         )
-                        st.caption(f"PDF 생성 상태: {dbg}")
+
+                    with col_dl2:
+                        pdf_bytes, dbg = markdown_to_pdf_korean(report_md, title="Gemini 분석 보고서")
+                        if pdf_bytes:
+                            st.download_button(
+                                "📥 다운로드 (.pdf)",
+                                data=pdf_bytes,
+                                file_name=f"{final_filename}.pdf",
+                                mime="application/pdf",
+                                use_container_width=True
+                            )
+                        else:
+                            st.error(f"PDF 생성 실패: {dbg}")
+
+                    # ✅ DOCX 다운로드 추가
+                    with col_dl3:
+                        if HAS_DOCX_LIB:
+                            docx_file = markdown_to_docx(report_md, title=raw_title if match else "분석 보고서")
+                            if docx_file:
+                                st.download_button(
+                                    "📥 다운로드 (수정가능 .docx)",
+                                    data=docx_file,
+                                    file_name=f"{final_filename}.docx",
+                                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                                    use_container_width=True
+                                )
+                            else:
+                                st.error("DOCX 변환 실패")
+                        else:
+                            st.warning("python-docx 라이브러리 미설치")
+
 
                 # ===== 컨텍스트 챗봇 =====
                 st.markdown("---")
