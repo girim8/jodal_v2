@@ -1,8 +1,6 @@
 # -*- coding: utf-8 -*-
-# app.py — Streamlit Cloud 단일 파일 통합본 (Full Version)
-# - Features: Upstage OCR (Expanded Exts), 3-Level Analysis Buttons, Full CSS/Dicts
-# - Logic: Split Buttons (Flash 2.0 / Flash 3.0 / Upstage OCR) -> Gemini -> Local Fallback
-# - Updates: DOCX Download added, Org Search display fixed
+# app.py — Streamlit Cloud 단일 파일 통합본 (Fixed Hover & Data Version)
+# - Updates: Fixed Chart Tooltip Indexing, NaN Handling, Strict Column Ordering
 
 import os
 import re
@@ -26,7 +24,7 @@ import plotly.express as px
 import markdown as md_lib
 from xhtml2pdf import pisa
 
-# ✅ DOCX 생성을 위한 라이브러리 (pip install python-docx 필요)
+# ✅ DOCX 생성을 위한 라이브러리
 try:
     from docx import Document
     from docx.shared import Pt
@@ -44,10 +42,9 @@ from xml.etree import ElementTree
 import olefile
 
 # =============================
-# 전역 설정 (기본 모델 우선순위)
+# 전역 설정
 # =============================
-# ※ 버튼 클릭 시 이 순서가 동적으로 변경됨
-MODEL_PRIORITY = ["gemini-3.0-flash-preview", "gemini-2.0-flash-exp"]
+MODEL_PRIORITY = ["gemini-3-flash-preview", "gemini-2.0-flash", "gemini-pro-latest"]
 
 st.set_page_config(page_title="조달입찰 분석 시스템", layout="wide", initial_sidebar_state="expanded")
 st.markdown(
@@ -100,7 +97,7 @@ def _redact_secrets(text: str) -> str:
 
 
 # =============================
-# Secrets 헬퍼 (Robust Auth)
+# Secrets 헬퍼
 # =============================
 def _get_auth_users_from_secrets() -> list:
     try:
@@ -137,7 +134,6 @@ def _get_upstage_key_from_secrets() -> str | None:
         key = st.secrets.get("UPSTAGE_API_KEY") if "UPSTAGE_API_KEY" in st.secrets else None
         if key and str(key).strip():
             return str(key).strip()
-        # 환경변수 폴백
         env_key = os.environ.get("UPSTAGE_API_KEY")
         if env_key:
             return env_key
@@ -147,7 +143,7 @@ def _get_upstage_key_from_secrets() -> str | None:
 
 
 # =============================
-# Gemini API 키 관리 (우선순위 + 로테이션)
+# Gemini API 키 관리
 # =============================
 def _get_gemini_key_list() -> list[str]:
     sidebar_key = st.session_state.get("user_input_gemini_key", "").strip()
@@ -192,9 +188,6 @@ def _gemini_messages_to_contents(messages):
 
 
 def call_gemini(messages, temperature=0.4, max_tokens=2000):
-    """
-    Gemini API 호출 함수 (Smart Fallback Logic + Error Warning)
-    """
     key_list = _get_gemini_key_list()
     if not key_list:
         raise Exception("Gemini API 키가 설정되지 않았습니다.")
@@ -213,13 +206,9 @@ def call_gemini(messages, temperature=0.4, max_tokens=2000):
     contents = _gemini_messages_to_contents(safe_messages)
 
     last_exception = None
-    
-    # 전역 변수 MODEL_PRIORITY 참조 (버튼에 따라 변경됨)
     current_models = MODEL_PRIORITY 
 
-    # 🔄 [스마트 폴백 루프] 모델 우선순위대로 순회
     for model in current_models:
-        # 키 로테이션
         for current_key in key_list:
             url = f"{GEMINI_API_BASE}/{model}:generateContent"
             headers = {"Content-Type": "application/json", "X-goog-api-key": current_key}
@@ -240,50 +229,37 @@ def call_gemini(messages, temperature=0.4, max_tokens=2000):
                 candidates = data.get("candidates", [])
                 if not candidates:
                     if data.get("promptFeedback"):
-                        # 차단된 경우
                         raise Exception(f"Prompt Feedback Blocked: {data['promptFeedback']}")
                     raise Exception(f"응답 없음 (candidates Empty): {data}")
                 
                 parts = candidates[0]["content"]["parts"]
                 text = "\n".join([p.get("text", "") for p in parts]).strip()
-                
-                # ✅ 성공 시 반환
                 return text, model
 
             except requests.exceptions.HTTPError as e:
                 code = e.response.status_code
                 last_exception = e
-                
-                # 🛑 404/400: 모델 미지원 -> 다음 모델로 Fallback
                 if code in [404, 400]:
                     warn_msg = f"⚠️ [{model}] 호출 실패 (Code {code}): 이 모델은 현재 리전/프로젝트에서 사용할 수 없습니다. 하위 모델로 전환합니다."
                     print(warn_msg)
                     st.warning(warn_msg)
-                    break # 키 루프 탈출 -> 다음 모델로
-                
-                # 🛑 429: 쿼터 초과 -> 같은 모델 다른 키 시도
+                    break 
                 if code == 429:
                     time.sleep(1) 
                     continue
-                
-                # 기타 에러: 다음 키 시도
                 continue
                 
             except Exception as e:
                 last_exception = e
-                continue # 다음 키 시도
+                continue
 
-    # 모든 모델, 모든 키 다 실패했을 때
     raise Exception(f"모든 모델({current_models}) 시도 실패. Last Error: {last_exception}")
 
 
 # =============================
-# ✅ Upstage API 텍스트 추출
+# Upstage API 텍스트 추출
 # =============================
 def upstage_try_extract(file_bytes: bytes, filename: str) -> str | None:
-    """
-    Upstage Document Parse API를 사용하여 문서 텍스트를 추출합니다.
-    """
     api_key = _get_upstage_key_from_secrets()
     if not api_key:
         return None
@@ -291,22 +267,17 @@ def upstage_try_extract(file_bytes: bytes, filename: str) -> str | None:
     try:
         url = "https://api.upstage.ai/v1/document-ai/document-parse"
         headers = {"Authorization": f"Bearer {api_key}"}
-        
-        # Multipart Upload
         files = {"document": (filename, file_bytes)}
         
-        # "ocr" 옵션 등은 필요 시 payload로 추가 가능하나 기본 호출 사용
         response = requests.post(url, headers=headers, files=files, timeout=60)
         
         if response.status_code == 200:
             result = response.json()
             content = result.get("content", {})
-            
-            # Markdown이 있으면 최우선
             if isinstance(content, dict):
                 text = content.get("markdown") or content.get("text") or content.get("html") or ""
             else:
-                text = str(content) # 구형 응답 대비
+                text = str(content)
                 
             if len(text) > 50:
                 return _redact_secrets(text)
@@ -318,7 +289,7 @@ def upstage_try_extract(file_bytes: bytes, filename: str) -> str | None:
 
 
 # =============================
-# ✅ Gemini 파일(바이너리 포함) 직접 선추출 헬퍼
+# Gemini 파일 직접 선추출 헬퍼
 # =============================
 def guess_mime_type(filename: str) -> str:
     ext = (os.path.splitext(filename)[1] or "").lower()
@@ -385,7 +356,6 @@ def gemini_try_extract_text_from_file(
         }
     }
 
-    # 🔄 [스마트 폴백 루프] 파일 추출도 모델 우선순위 적용
     current_models = MODEL_PRIORITY
     
     for model in current_models:
@@ -413,7 +383,6 @@ def gemini_try_extract_text_from_file(
             except requests.exceptions.HTTPError as e:
                 code = e.response.status_code
                 if code in [404, 400]:
-                    # 파일 추출에서는 UI 경고 없이 조용히 다음 모델 시도
                     break 
                 if code == 429:
                     time.sleep(1)
@@ -426,7 +395,7 @@ def gemini_try_extract_text_from_file(
 
 
 # =============================
-# ✅ HWP/HWPX 로컬 텍스트 추출
+# HWP/HWPX 로컬 텍스트 추출
 # =============================
 def _maybe_decompress(data: bytes) -> bytes:
     for mode in (-zlib.MAX_WBITS, zlib.MAX_WBITS, None):
@@ -543,7 +512,7 @@ def convert_to_text(data: bytes, filename: str | None = None) -> tuple[str, str]
 try:
     from PyPDF2 import PdfReader
 except Exception:
-    PdfReader = None  # type: ignore
+    PdfReader = None 
 
 
 def extract_text_from_pdf_bytes(file_bytes: bytes) -> str:
@@ -557,7 +526,7 @@ def extract_text_from_pdf_bytes(file_bytes: bytes) -> str:
 
 
 # =============================
-# ✅ Markdown → HTML → PDF
+# Markdown → HTML → PDF
 # =============================
 def markdown_to_pdf_korean(md_text: str, title: str | None = None):
     try:
@@ -641,7 +610,7 @@ def markdown_to_pdf_korean(md_text: str, title: str | None = None):
         return None, f"PDF 생성 실패: {e}"
 
 # =============================
-# ✅ Markdown → DOCX (New Feature)
+# Markdown → DOCX
 # =============================
 def markdown_to_docx(md_text: str, title: str = "분석 보고서") -> BytesIO | None:
     if not HAS_DOCX_LIB:
@@ -651,27 +620,21 @@ def markdown_to_docx(md_text: str, title: str = "분석 보고서") -> BytesIO |
         doc = Document()
         doc.add_heading(title, 0)
         
-        # 라인 단위 파싱 (간이 파서)
         lines = md_text.split('\n')
-        table_buffer = [] # 테이블 라인 임시 저장
+        table_buffer = [] 
         
         def _flush_table(buffer):
             if not buffer: return
             try:
-                # | Col1 | Col2 | ... 형태 가정
-                # 첫 줄은 헤더, 두번째는 구분선(|---|), 나머지는 데이터
                 rows_data = []
                 for b_line in buffer:
-                    # 양 끝의 | 제거 및 분리
                     cells = [c.strip() for c in b_line.strip('|').split('|')]
                     rows_data.append(cells)
                 
-                # 구분선 제거 (--- 들어있는 라인)
                 valid_rows = [r for r in rows_data if not (r and '---' in r[0])]
                 
                 if not valid_rows: return
                 
-                # 테이블 생성
                 max_cols = max(len(r) for r in valid_rows)
                 table = doc.add_table(rows=len(valid_rows), cols=max_cols)
                 table.style = 'Table Grid'
@@ -682,16 +645,14 @@ def markdown_to_docx(md_text: str, title: str = "분석 보고서") -> BytesIO |
                         if c_idx < len(row_cells):
                             row_cells[c_idx].text = cell_text
                 
-                doc.add_paragraph("") # 테이블 뒤 공백
+                doc.add_paragraph("") 
             except Exception:
-                # 테이블 파싱 실패 시 그냥 텍스트로 덤프
                 for b_line in buffer:
                     doc.add_paragraph(b_line)
         
         for line in lines:
             stripped = line.strip()
             
-            # 테이블 감지
             if stripped.startswith('|'):
                 table_buffer.append(stripped)
                 continue
@@ -700,7 +661,6 @@ def markdown_to_docx(md_text: str, title: str = "분석 보고서") -> BytesIO |
                     _flush_table(table_buffer)
                     table_buffer = []
             
-            # 일반 텍스트 처리
             if not stripped:
                 continue
             
@@ -717,7 +677,6 @@ def markdown_to_docx(md_text: str, title: str = "분석 보고서") -> BytesIO |
             else:
                 doc.add_paragraph(line)
         
-        # 남은 테이블 처리
         if table_buffer:
             _flush_table(table_buffer)
 
@@ -732,7 +691,7 @@ def markdown_to_docx(md_text: str, title: str = "분석 보고서") -> BytesIO |
 
 
 # =============================
-# 서비스구분 컬럼 생성 (전체 딕셔너리 복구)
+# 서비스구분 컬럼 생성
 # =============================
 classification_rules = {
     '통신': '전용회선', '회선': '전용회선', '전송': '전용회선', '망': '전용회선',
@@ -774,7 +733,7 @@ def add_service_category(df: pd.DataFrame) -> pd.DataFrame:
         df = df.copy()
         _ = df.pop("서비스구분")
 
-    df["서비스구분"] = "미분류"  # 맨 뒤에 생성
+    df["서비스구분"] = "미분류"
 
     if "입찰공고명" not in df.columns:
         return df
@@ -794,7 +753,7 @@ def add_service_category(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # =============================
-# 첨부 링크 매트릭스 (CSS 포함)
+# 첨부 링크 매트릭스
 # =============================
 CSS_COMPACT = """
 <style>
@@ -1015,7 +974,7 @@ def render_sidebar_base():
     st.sidebar.radio("# 📋 메뉴 선택", ["조달입찰결과현황", "내고객 분석하기"], key="menu")
 
     st.sidebar.markdown("---")
-    with st.sidebar.expander("🔑 Gemini API Key 설정", expanded=True):
+    with st.sidebar.expander("🔑 Gemini API Key 설정", expanded=False):
         st.markdown("""
         <small>입력값이 있으면 st.secrets보다 <b>우선 사용</b>됩니다.</small>
         """, unsafe_allow_html=True)
@@ -1032,45 +991,68 @@ def render_sidebar_base():
             st.sidebar.success(f"✅ Gemini 사용 가능 ({len(current_keys)}개 키 로드됨)")
         else:
             st.sidebar.warning("⚠️ Gemini 키가 없습니다.")
-            
-    # ===== 디버깅 도구 (관리자 전용 / requests 방식) =====
-    if st.session_state.get("role") == "admin":
-        st.sidebar.markdown("---")
-        st.sidebar.subheader("🛠️ 디버깅 도구")
-        
-        if st.sidebar.button("내 API로 쓸 수 있는 모델 확인하기"):
-            try:
-                # 1. 키 가져오기 (입력값 우선 -> 없으면 Secrets)
-                chk_key = st.session_state.get("user_input_gemini_key", "").strip()
-                if not chk_key:
-                    chk_key = _get_gemini_key_from_secrets()
-                
-                if not chk_key:
-                    st.sidebar.error("API 키가 없습니다.")
-                else:
-                    # 2. 모델 조회 (REST API 사용 - 라이브러리 설치 불필요)
-                    test_key = chk_key.split(",")[0].strip()
-                    url = f"https://generativelanguage.googleapis.com/v1beta/models?key={test_key}"
-                    
-                    response = requests.get(url, timeout=10)
-                    
-                    if response.status_code == 200:
-                        data = response.json()
-                        models = data.get("models", [])
-                        valid_models = []
-                        for m in models:
-                            if "generateContent" in m.get("supportedGenerationMethods", []):
-                                m_name = m.get("name", "").replace("models/", "")
-                                valid_models.append(m_name)
+
+        # 현행 키호출명 체크
+
+        current_keys = _get_gemini_key_list()
+        if current_keys:
+            st.sidebar.success(f"✅ Gemini 사용 가능 ({len(current_keys)}개 키 로드됨)")
+
+# [▼▼▼ Admin: 중첩 오류 수정된 버전 ▼▼▼]
+            if st.session_state.get("role") == "admin":
+                with st.sidebar.expander("👮 [Admin] 모델 리스트 관리", expanded=True):
+                    try:
+                        chk_key = current_keys[0]
+                        chk_url = "https://generativelanguage.googleapis.com/v1beta/models"
+                        chk_res = requests.get(chk_url, params={"key": chk_key}, timeout=10)
                         
-                        st.sidebar.success(f"조회 성공! ({len(valid_models)}개)")
-                        st.sidebar.code("\n".join(valid_models))
-                    else:
-                        st.sidebar.error(f"조회 실패 (HTTP {response.status_code}): {response.text}")
+                        if chk_res.status_code == 200:
+                            data = chk_res.json()
+                            model_list = data.get("models", [])
+                            
+                            if model_list:
+                                # 1. 보기 좋게 DataFrame으로 변환
+                                df_models = pd.DataFrame(model_list)
+                                
+                                # 2. 엑셀 파일 메모리에 생성
+                                excel_buf = BytesIO()
+                                df_models.to_excel(excel_buf, index=False, engine="openpyxl")
+                                excel_buf.seek(0)
+                                
+                                # 3. 다운로드 버튼 생성
+                                st.download_button(
+                                    label="📥 엑셀로 전체 다운로드",
+                                    data=excel_buf,
+                                    file_name=f"gemini_models_{datetime.now().strftime('%Y%m%d')}.xlsx",
+                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                    use_container_width=True
+                                )
+                                
+                                # 4. 화면에는 '이름'과 '설명'만 깔끔하게 표로 보여주기
+                                st.caption("👇 모델 리스트 (name 컬럼 복사 사용)")
+                                cols_to_show = [c for c in ["name", "displayName", "inputTokenLimit"] if c in df_models.columns]
+                                st.dataframe(
+                                    df_models[cols_to_show] if cols_to_show else df_models, 
+                                    hide_index=True,
+                                    use_container_width=True
+                                )
+                                
+                                # 5. [수정됨] Expander 대신 체크박스 사용
+                                if st.checkbox("JSON 원본 데이터 보기"):
+                                    st.json(data)
+                            else:
+                                st.warning("수신된 모델 리스트가 없습니다.")
+                        else:
+                            st.error(f"API 호출 실패 (Code: {chk_res.status_code})")
+                            st.caption(chk_res.text)
+                            
+                    except Exception as e:
+                        st.error(f"오류 발생: {str(e)}")
+            # [▲▲▲ 코드 끝 ▲▲▲]
 
-            except Exception as e:
-                st.sidebar.error(f"오류 발생: {e}")
-
+        
+        else:
+            st.sidebar.warning("⚠️ Gemini 키가 없습니다.")
 
 def render_sidebar_filters(df: pd.DataFrame):
     st.sidebar.markdown("---")
@@ -1098,7 +1080,7 @@ def render_sidebar_filters(df: pd.DataFrame):
         org_list = sorted(df[demand_col_sidebar].dropna().unique())
         st.sidebar.multiselect(f"{demand_col_sidebar} 필터 (복수 가능)", org_list, key="selected_orgs")
 
-    st.sidebar.subheader("📆 공고게시일자 필터")
+    st.sidebar.subheader("📆 공고게시일자 필터 (복수가능)")
     if "공고게시일자_date" in df.columns:
         df["_tmp_date"] = pd.to_datetime(df["공고게시일자_date"], errors="coerce")
     else:
@@ -1106,10 +1088,13 @@ def render_sidebar_filters(df: pd.DataFrame):
 
     df["_tmp_year"] = df["_tmp_date"].dt.year
     year_list = sorted([int(x) for x in df["_tmp_year"].dropna().unique()])
-    st.sidebar.multiselect("연도 선택 (복수 가능)", year_list, default=[], key="selected_years")
-
-    df["_tmp_month"] = df["_tmp_date"].dt.month
-    st.sidebar.multiselect("월 선택 (복수 가능)", list(range(1, 13)), default=[], key="selected_months")
+    
+    col_y, col_m = st.sidebar.columns(2)
+    with col_y:
+        st.multiselect("연도 선택", year_list, default=[], key="selected_years")
+    
+    with col_m:
+        st.multiselect("월 선택", list(range(1, 13)), default=[], key="selected_months")
 
 
 # ===== 진입 가드 =====
@@ -1132,11 +1117,9 @@ try:
     df = pd.read_excel(uploaded_file, sheet_name="filtered", engine="openpyxl")
     
     # ✅ 안전장치: 공고게시일자_date 컬럼 자동 생성
-    # 1. 이미 존재하는 경우 -> datetime 변환
     if "공고게시일자_date" in df.columns:
         df["공고게시일자_date"] = pd.to_datetime(df["공고게시일자_date"], errors="coerce")
     else:
-        # 2. 유사 컬럼 찾기 (공고게시일자, 게시일자, 일자 등)
         date_candidates = ["공고게시일자", "게시일자", "일자", "등록일", "입력일시"]
         found_col = None
         for cand in date_candidates:
@@ -1147,7 +1130,6 @@ try:
         if found_col:
             df["공고게시일자_date"] = pd.to_datetime(df[found_col], errors="coerce")
         else:
-            # 3. 없으면 NaT로 채움 (차트에서 제외됨)
             df["공고게시일자_date"] = pd.NaT
 
 except Exception as e:
@@ -1172,7 +1154,6 @@ selected_months = st.session_state.get("selected_months", [])
 demand_col_sidebar = "수요기관명" if "수요기관명" in df.columns else ("수요기관" if "수요기관" in df.columns else None)
 
 df_filtered = df.copy()
-# (위에서 이미 처리했지만 필터링용 파생변수 생성)
 df_filtered["year"] = df_filtered["공고게시일자_date"].dt.year
 df_filtered["month"] = df_filtered["공고게시일자_date"].dt.month
 
@@ -1191,7 +1172,7 @@ if service_selected and "서비스구분" in df_filtered.columns:
 
 
 # =============================
-# 기본 분석(차트) - Final Robust Version
+# 기본 분석(차트)
 # =============================
 def render_basic_analysis_charts(base_df: pd.DataFrame):
     def pick_unit(max_val: float):
@@ -1220,24 +1201,21 @@ def render_basic_analysis_charts(base_df: pd.DataFrame):
         st.warning("컬럼 '낙찰자선정여부'를 찾을 수 없습니다.")
         return
     
-    # 낙찰 데이터만 필터링
     dwin = base_df[base_df["낙찰자선정여부"] == "Y"].copy()
     if dwin.empty:
         st.warning("낙찰(Y) 데이터가 없습니다.")
         return
 
-    # 숫자 컬럼 강제 변환 (에러 방지)
     for col in ["투찰금액", "배정예산금액", "투찰율"]:
         if col in dwin.columns:
             dwin[col] = pd.to_numeric(dwin[col], errors="coerce")
 
-    # 대표업체 표시용 컬럼 생성
     if "대표업체" in dwin.columns:
         dwin["대표업체_표시"] = dwin["대표업체"].map(normalize_vendor)
     else:
         dwin["대표업체_표시"] = "기타"
 
-    # 1) 대표업체별 분포 (Pie Charts)
+    # 1) 대표업체별 분포
     try:
         st.markdown("### 1) 대표업체별 분포")
         unit_choice = st.selectbox("파이차트(투찰금액 합계) 표기 단위", ["자동", "원", "백만원", "억원", "조원"], index=0)
@@ -1287,7 +1265,7 @@ def render_basic_analysis_charts(base_df: pd.DataFrame):
     except Exception as e:
         st.error(f"1번 차트 생성 중 오류 발생: {e}")
 
-    # 2) 낙찰 특성 비율 (Metrics & Pie Chart)
+    # 2) 낙찰 특성 비율
     try:
         st.markdown("### 2) 낙찰 특성 비율")
         c1, c2 = st.columns(2)
@@ -1300,19 +1278,15 @@ def render_basic_analysis_charts(base_df: pd.DataFrame):
                 st.info("낙찰방법 컬럼 없음")
         
         with c2:
-            # ✅ 긴급공고여부 또는 긴급공고 컬럼 확인
             col_urgent = "긴급공고여부" if "긴급공고여부" in dwin.columns else ("긴급공고" if "긴급공고" in dwin.columns else None)
             
             if col_urgent:
-                # 데이터 전처리: 결측치 및 공백 처리
                 s_urgent = dwin[col_urgent].fillna("미입력").astype(str).str.strip()
                 s_urgent = s_urgent.replace({"": "미입력", "nan": "미입력"})
                 
-                # 빈도 계산
                 dist_urgent = s_urgent.value_counts().reset_index()
                 dist_urgent.columns = ["여부", "건수"]
                 
-                # 파이차트 생성
                 fig_urgent = px.pie(
                     dist_urgent,
                     names="여부",
@@ -1336,13 +1310,11 @@ def render_basic_analysis_charts(base_df: pd.DataFrame):
         st.markdown("### 3) 투찰율 산점도 & 4) 업체/년도별 수주금액")
         col_scatter, col_bar3 = st.columns(2)
         
-        # 3) 산점도
         with col_scatter:
             if "투찰율" in dwin.columns:
-                # 날짜 변환 (에러 방지용으로 한번 더 수행)
                 dwin["공고게시일자_date"] = pd.to_datetime(dwin.get("공고게시일자_date", pd.NaT), errors="coerce")
                 dplot = dwin.dropna(subset=["투찰율", "공고게시일자_date"]).copy()
-                dplot = dplot[dplot["투찰율"] <= 300] # 이상치 제거
+                dplot = dplot[dplot["투찰율"] <= 300] 
                 
                 hover_cols = [c for c in ["대표업체_표시", "수요기관명", "공고명", "입찰공고명", "입찰공고번호"] if c in dplot.columns]
                 
@@ -1363,7 +1335,6 @@ def render_basic_analysis_charts(base_df: pd.DataFrame):
             else:
                 st.info("투찰율 컬럼 없음 - 산점도 생략")
 
-        # 4) 막대그래프
         with col_bar3:
             if "투찰금액" in dwin.columns:
                 dyear = dwin.copy()
@@ -1393,7 +1364,7 @@ def render_basic_analysis_charts(base_df: pd.DataFrame):
 
     # 5) 배정예산금액 누적 막대
     try:
-        st.markdown("### 5) 연·분기별 배정예산금액 — 누적 막대 & 총합")
+        st.markdown("### 5) 연·분기별 배정예산금액 — 누적 막대 & 사업별 구성")
         col_stack, col_total = st.columns(2)
         
         if "배정예산금액" not in dwin.columns:
@@ -1415,30 +1386,16 @@ def render_basic_analysis_charts(base_df: pd.DataFrame):
                 title_col = "입찰공고명" if "입찰공고명" in g.columns else ("공고명" if "공고명" in g.columns else None)
                 group_col = "대표업체_표시"
 
-                # 좌측 스택바
+                # [Left Chart] Vendor Stack
                 with col_stack:
                     grp = g.groupby(["연도분기", group_col])["배정예산금액"].sum().reset_index(name="금액합")
                     if not grp.empty:
-                        if title_col:
-                            title_map = (
-                                g.groupby(["연도분기", group_col])[title_col]
-                                .apply(lambda s: " | ".join(pd.Series(s).dropna().astype(str).unique()[:10]))
-                                .rename("입찰공고목록")
-                                .reset_index()
-                            )
-                            grp = grp.merge(title_map, on=["연도분기", group_col], how="left")
-                            grp["입찰공고목록"] = grp["입찰공고목록"].fillna("")
-                        else:
-                            grp["입찰공고목록"] = ""
-                            
+                        # 정렬 로직
                         grp["연"] = grp["연도분기"].str.extract(r"(\d{4})").astype(int)
                         grp["분"] = grp["연도분기"].str.extract(r"Q(\d)").astype(int)
                         grp = grp.sort_values(["연", "분", group_col]).reset_index(drop=True)
                         ordered_quarters = grp.sort_values(["연", "분"])["연도분기"].unique()
                         grp["연도분기"] = pd.Categorical(grp["연도분기"], categories=ordered_quarters, ordered=True)
-                        
-                        import numpy as _np
-                        custom = _np.column_stack([grp[group_col].astype(str).to_numpy(), grp["입찰공고목록"].astype(str).to_numpy()])
                         
                         fig_stack = px.bar(
                             grp,
@@ -1446,64 +1403,83 @@ def render_basic_analysis_charts(base_df: pd.DataFrame):
                             y="금액합",
                             color=group_col,
                             barmode="stack",
-                            title=f"연·분기별 배정예산금액 — 누적(스택) / 그룹: {group_col}",
+                            title=f"연·분기별 배정예산금액 (업체별)",
                             color_discrete_map=VENDOR_COLOR_MAP,
                             color_discrete_sequence=OTHER_SEQ,
-                        )
-                        fig_stack.update_traces(
-                            customdata=custom,
-                            hovertemplate=(
-                                "<b>%{x}</b><br>" +
-                                f"{group_col}: %{{customdata[0]}}<br>" +
-                                "금액: %{y:,.0f} 원<br>" +
-                                "입찰공고명: %{customdata[1]}"
-                            ),
                         )
                         fig_stack.update_layout(xaxis_title="연도분기", yaxis_title="배정예산금액 (원)", margin=dict(l=10, r=10, t=60, b=10))
                         st.plotly_chart(fig_stack, use_container_width=True)
                     else:
                         st.info("그룹핑 결과가 비어 있습니다.")
 
-                # 우측 총합바
+                # [Right Chart] Project Stack
                 with col_total:
-                    grp_total = g.groupby("연도분기")["배정예산금액"].sum().reset_index(name="금액합")
-                    grp_total["연"] = grp_total["연도분기"].str.extract(r"(\d{4})").astype(int)
-                    grp_total["분"] = grp_total["연도분기"].str.extract(r"Q(\d)").astype(int)
-                    grp_total = grp_total.sort_values(["연", "분"])
-                    
                     if title_col:
-                        titles_total = (
-                            g.groupby("연도분기")[title_col]
-                            .apply(lambda s: " | ".join(pd.Series(s).dropna().astype(str).unique()[:10]))
-                            .reindex(grp_total["연도분기"]).fillna("")
+                        # ✅ [수정] 대표업체, 수요기관명, 투찰율, 서비스구분 정보 추가 수집
+                        grp_proj = g.groupby(["연도분기", title_col]).agg({
+                            "배정예산금액": "sum",
+                            "대표업체": lambda x: x.iloc[0] if not x.empty else "",
+                            "수요기관명": lambda x: x.iloc[0] if not x.empty else "",
+                            "투찰율": lambda x: x.mean() if not x.empty else 0,
+                            "서비스구분": lambda x: x.iloc[0] if not x.empty else ""
+                        }).reset_index()
+                        
+                        grp_proj.rename(columns={"배정예산금액": "금액"}, inplace=True)
+                        # ✅ [수정] NaN 처리
+                        grp_proj["투찰율"] = grp_proj["투찰율"].fillna(0)
+                        
+                        # 연/분 추출
+                        grp_proj["연"] = grp_proj["연도분기"].str.extract(r"(\d{4})").astype(int)
+                        grp_proj["분"] = grp_proj["연도분기"].str.extract(r"Q(\d)").astype(int)
+                        
+                        # ✅ [수정] 정렬: 연/분 오름차순, 금액 오름차순
+                        grp_proj = grp_proj.sort_values(["연", "분", "금액"], ascending=[True, True, True]).reset_index(drop=True)
+                        
+                        # ✅ [수정] Hover Data 순서 명시적 지정 (Customdata 인덱스 고정)
+                        # 순서: [0: title, 1: 대표업체, 2: 수요기관, 3: 투찰율, 4: 서비스]
+                        hover_cols = [title_col, "대표업체", "수요기관명", "투찰율", "서비스구분"]
+                        
+                        fig_proj_stack = px.bar(
+                            grp_proj, 
+                            x="연도분기", 
+                            y="금액", 
+                            color=title_col,
+                            title="연·분기별 배정예산금액 (사업별 누적)",
+                            hover_data=hover_cols
                         )
-                        import numpy as _np
-                        custom2 = _np.stack([titles_total], axis=-1)
+                        
+                        # ✅ [수정] Hover Template에서 명시적 인덱스 사용
+                        fig_proj_stack.update_traces(
+                            hovertemplate=(
+                                "<b>%{x}</b><br>"
+                                "사업명: %{customdata[0]}<br>"
+                                "금액: %{y:,.0f} 원<br>"
+                                "대표업체: %{customdata[1]}<br>"
+                                "수요기관: %{customdata[2]}<br>"
+                                "투찰율: %{customdata[3]:.2f}%<br>"
+                                "서비스: %{customdata[4]}"
+                                "<extra></extra>"
+                            )
+                        )
+                        fig_proj_stack.update_layout(
+                            xaxis_title="연도분기", 
+                            yaxis_title="배정예산금액 (원)",
+                            showlegend=False
+                        )
+                        st.plotly_chart(fig_proj_stack, use_container_width=True)
                     else:
-                        import numpy as _np
-                        custom2 = _np.stack([pd.Series([""] * len(grp_total))], axis=-1)
-                    
-                    fig_bar = px.bar(grp_total, x="연도분기", y="금액합", title="연·분기별 배정예산금액 (총합)", text="금액합")
-                    fig_bar.update_traces(
-                        customdata=custom2,
-                        hovertemplate="<b>%{x}</b><br>총액: %{y:,.0f} 원<br>입찰공고명: %{customdata[0]}",
-                        texttemplate='%{text:,.0f}',
-                        textposition='outside',
-                        cliponaxis=False,
-                    )
-                    st.plotly_chart(fig_bar, use_container_width=True)
+                        st.info("공고명/입찰공고명 컬럼이 없어 사업별 누적 그래프를 그릴 수 없습니다.")
 
     except Exception as e:
         st.error(f"5번 차트 생성 중 오류 발생: {e}")
 
 
 # =============================
-# LLM 분석용 텍스트 추출 (Updated: Button-Specific Upstage & Expanded Exts)
+# LLM 분석용 텍스트 추출
 # =============================
 def extract_text_combo_gemini_first(uploaded_files, use_upstage=True):
     combined_texts, convert_logs = [], []
     
-    # ✅ Upstage로 처리할 확장자 (요청사항 반영)
     UPSTAGE_TARGET_EXTS = {
         ".hwp", ".hwpx", ".pdf", 
         ".png", ".jpg", ".jpeg", ".tif", ".tiff", 
@@ -1515,31 +1491,23 @@ def extract_text_combo_gemini_first(uploaded_files, use_upstage=True):
         data = f.read()
         ext = (os.path.splitext(name)[1] or "").lower()
 
-        # 무료 티어 429 방지용 지연
         if idx > 0:
             time.sleep(1.5)
         
-        # ---------------------------------------------------------
-        # 1. [최우선] Upstage OCR 시도 (버튼이 켜져있고 + 지원 포맷인 경우)
-        # ---------------------------------------------------------
         if use_upstage and (ext in UPSTAGE_TARGET_EXTS):
             up_txt = upstage_try_extract(data, name)
             if up_txt:
                 convert_logs.append(f"🦋 {name}: Upstage OCR 성공 ({len(up_txt)}자)")
                 combined_texts.append(f"\n\n===== [{name} | Upstage OCR] =====\n{up_txt}\n")
-                continue # 성공하면 다음 파일로
+                continue 
             else:
                 convert_logs.append(f"ℹ️ {name}: Upstage 실패/키 없음 → Gemini/Local 로직으로 이동")
         elif use_upstage and (ext not in UPSTAGE_TARGET_EXTS):
             convert_logs.append(f"ℹ️ {name}: Upstage 미지원 포맷 → Gemini/Local 로직으로 이동")
         else:
-            # 신속 모드인 경우 로그
             if ext in UPSTAGE_TARGET_EXTS:
                 convert_logs.append(f"⏭️ {name}: 신속 모드 (Upstage 생략) → Gemini/Local 시도")
 
-        # ---------------------------------------------------------
-        # 2. Gemini 직접 추출 시도 (바이너리/이미지 포함)
-        # ---------------------------------------------------------
         gem_txt, used_model = gemini_try_extract_text_from_file(data, name)
         
         if gem_txt:
@@ -1549,10 +1517,6 @@ def extract_text_combo_gemini_first(uploaded_files, use_upstage=True):
         else:
             convert_logs.append(f"🤖 {name}: Gemini 추출 실패 → 로컬 폴백 진행")
 
-        # ---------------------------------------------------------
-        # 3. 로컬 라이브러리 폴백 (PyPDF2, olefile 등)
-        # ---------------------------------------------------------
-        # 3-1. HWP/HWPX
         if ext in {".hwp", ".hwpx"}:
             try:
                 txt, fmt = convert_to_text(data, name)
@@ -1562,7 +1526,6 @@ def extract_text_combo_gemini_first(uploaded_files, use_upstage=True):
             except Exception as e:
                 convert_logs.append(f"📄 {name}: 로컬 HWP/HWPX 추출 실패 ({e}) → 실패")
 
-        # 3-2. 일반 텍스트
         if ext in {".txt", ".csv", ".md", ".log"}:
             for enc in ("utf-8-sig", "utf-8", "cp949", "euc-kr"):
                 try:
@@ -1577,14 +1540,12 @@ def extract_text_combo_gemini_first(uploaded_files, use_upstage=True):
             combined_texts.append(f"\n\n===== [{name}] =====\n{_redact_secrets(txt)}\n")
             continue
 
-        # 3-3. PDF (PyPDF2)
         if ext == ".pdf":
             txt = extract_text_from_pdf_bytes(data)
             convert_logs.append(f"✅ {name}: 로컬 PDF 텍스트 추출 {len(txt)} chars")
             combined_texts.append(f"\n\n===== [{name}] =====\n{_redact_secrets(txt)}\n")
             continue
             
-        # 3-4. 기타 바이너리
         if ext in {".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx"}:
             convert_logs.append(f"ℹ️ {name}: 바이너리 직접 추출 실패 (Gemini가 읽지 못함)")
             continue
@@ -1601,18 +1562,60 @@ menu_val = st.session_state.get("menu")
 
 if menu_val == "조달입찰결과현황":
     st.title("📑 조달입찰결과현황")
+    
+    # ✅ [핵심 수정] 화면 표시 및 다운로드를 위한 "강제 정렬 DF 생성 전처리"
+    # 원하는 컬럼 순서 (사용자 지정)
+    target_order = [
+        "입찰공고명", "공고명", 
+        "수요기관명", "수요기관", 
+        "대표업체", 
+        "서비스구분", 
+        "투찰금액", 
+        "입찰공고번호", "공고번호", 
+        "year", "month", 
+        "낙찰자선정여부", 
+        "투찰율", 
+        "개찰순위", 
+        "조달방식구분", 
+        "낙찰방법", 
+        "긴급공고여부", "긴급공고",
+        "수요기관지역"
+    ]
+    
+    # 1. 실제 데이터프레임에 존재하는 컬럼만 필터링 (순서 유지)
+    exist_cols = []
+    seen = set()
+    for c in target_order:
+        if c in df_filtered.columns and c not in seen:
+            exist_cols.append(c)
+            seen.add(c)
+            
+    # 2. 순서 리스트에 없는 나머지 컬럼들 (맨 뒤로 보냄)
+    other_cols = [c for c in df_filtered.columns if c not in seen]
+    
+    # 3. 새로운 DataFrame 변수에 할당 (Deep Copy)
+    df_display = df_filtered[exist_cols + other_cols].copy()
+
     dl_buf = BytesIO()
-    df_filtered.to_excel(dl_buf, index=False, engine="openpyxl")
+    df_display.to_excel(dl_buf, index=False, engine="openpyxl")
     dl_buf.seek(0)
+    
     st.download_button(
         label="📥 필터링된 데이터 다운로드 (Excel)",
         data=dl_buf,
         file_name=f"filtered_result_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
-    st.data_editor(df_filtered, use_container_width=True, key="result_editor", height=520)
+    
+    st.data_editor(
+        df_display, 
+        use_container_width=True, 
+        key="result_view_sorted_final_v2", 
+        height=520
+    )
+    
     with st.expander("📊 기본 통계 분석(차트) 열기", expanded=False):
-        render_basic_analysis_charts(df_filtered)
+        render_basic_analysis_charts(df_display)
 
 elif menu_val == "내고객 분석하기":
     st.title("🧑‍💼 내고객 분석하기")
@@ -1635,8 +1638,6 @@ elif menu_val == "내고객 분석하기":
         st.write(f"총 {len(unique_orgs)}개 기관")
         search_org = st.text_input("기관명 검색", key="search_org_in_my")
         view_orgs = [o for o in unique_orgs if (search_org in str(o))] if search_org else unique_orgs
-        
-        # ✅ 따옴표/괄호 제거: 리스트 스트링이 아닌, 문자열 결합으로 표시
         st.write(", ".join([str(o) for o in view_orgs[:120]]))
 
     if customer_input:
@@ -1680,9 +1681,7 @@ elif menu_val == "내고객 분석하기":
                 with st.expander("차트 보기 (클릭하여 열기)", expanded=False):
                     render_basic_analysis_charts(result)
 
-                # =========================================================
-                # [수정 시작] Gemini 분석 섹션 (3버튼 분리 + 모델 지정)
-                # =========================================================
+                # ===== Gemini 분석 섹션 =====
                 st.markdown("---")
                 st.subheader("🤖 Gemini 분석")
 
@@ -1693,10 +1692,8 @@ elif menu_val == "내고객 분석하기":
                     key="src_files_uploader",
                 )
 
-                # ✅ 버튼 3개 분리
                 col_btn1, col_btn2, col_btn3 = st.columns(3)
                 
-                # 상태 변수 초기화
                 run_analysis = False
                 use_ocr_flag = False
                 target_models = []
@@ -1706,7 +1703,7 @@ elif menu_val == "내고객 분석하기":
                     if st.button("⚡ 초신속 (10초 이내)", use_container_width=True):
                         run_analysis = True
                         use_ocr_flag = False
-                        target_models = ["gemini-2.0-flash-exp"]
+                        target_models = ["gemini-2.0-flash-lite"]
                         
                 # 2. 신속 
                 with col_btn2:
@@ -1715,34 +1712,27 @@ elif menu_val == "내고객 분석하기":
                         use_ocr_flag = False
                         target_models = ["gemini-3-flash-preview"]
 
-                # 3. OCR 상세 (Upstage + 3.0우선 Fallback)
+                # 3. OCR 상세
                 with col_btn3:
                     if st.button("👁️ OCR 상세분석 (30초 이상)", use_container_width=True):
                         run_analysis = True
                         use_ocr_flag = True
-                        target_models = ["gemini-3-pro-preview", "gemini-2.0-flash-exp"]
+                        target_models = ["gemini-3-pro-preview", "gemini-2.5-pro"]
+                
                 if run_analysis:
                     if not src_files:
                         st.warning("먼저 분석할 파일을 업로드하세요.")
                     else:
-                        # =========================================================
-                        # [수정] global 키워드 삭제 (SyntaxError 해결)
-                        # =========================================================
-                        # 기존: global MODEL_PRIORITY (삭제!)
-                        
-                        # 그냥 바로 대입하면 전역 변수가 덮어씌워집니다.
                         MODEL_PRIORITY = target_models
 
-                        # 모드 라벨링
                         if use_ocr_flag:
                             mode_label = "OCR 상세분석"
                         elif "2.0" in target_models[0]:
-                            mode_label = "초신속(Gemini 2.0)"
+                            mode_label = "초신속(gemini-2.0-flash-lite)"
                         else:
-                            mode_label = "신속(Gemini 3.0)"
+                            mode_label = "신속gemini-3-flash-preview)"
 
                         with st.spinner(f"Gemini가 보고서를 작성 중... ({mode_label})"):
-                            # (이하 코드는 동일)
                             combined_text, logs, _ = extract_text_combo_gemini_first(src_files, use_upstage=use_ocr_flag)
 
                             st.session_state["gpt_convert_logs"] = logs
@@ -1774,7 +1764,6 @@ elif menu_val == "내고객 분석하기":
 {combined_text[:180000]}
 """.strip()
                                 try:
-                                    # 2. Gemini 호출 (위에서 설정한 MODEL_PRIORITY가 적용됨)
                                     report, used_model = call_gemini(
                                         [
                                             {"role": "system", "content": "당신은 SK브로드밴드 망설계/조달 제안 컨설턴트입니다."},
@@ -1785,7 +1774,7 @@ elif menu_val == "내고객 분석하기":
                                     )
 
                                     st.session_state["gpt_report_md"] = report
-                                    st.session_state["generated_src_pdfs"] = [] # 초기화
+                                    st.session_state["generated_src_pdfs"] = [] 
 
                                     st.success(f"보고서 생성이 완료되었습니다. (모델: **{used_model}**, 모드: {mode_label})")
 
@@ -1804,7 +1793,6 @@ elif menu_val == "내고객 분석하기":
                     st.markdown("### 📝 Gemini 분석 보고서")
                     st.markdown(report_md)
                     
-                    # 파일명 자동 생성
                     report_title = "Gemini_Analysis_Report"
                     match = re.search(r"^#\s+(.*)", report_md, re.MULTILINE)
                     if match:
@@ -1814,7 +1802,6 @@ elif menu_val == "내고객 분석하기":
                     
                     final_filename = f"{report_title}_{datetime.now().strftime('%Y%m%d')}"
 
-                    # 다운로드 버튼 그룹
                     col_dl1, col_dl2, col_dl3 = st.columns(3)
                     
                     with col_dl1:
@@ -1839,7 +1826,6 @@ elif menu_val == "내고객 분석하기":
                         else:
                             st.error(f"PDF 생성 실패: {dbg}")
 
-                    # ✅ DOCX 다운로드 추가
                     with col_dl3:
                         if HAS_DOCX_LIB:
                             docx_file = markdown_to_docx(report_md, title=raw_title if match else "분석 보고서")
