@@ -925,20 +925,42 @@ def normalize_vendor(name: str) -> str:
 # =============================
 INFO_BOX = "ID : 사번 네자리, PW :생년월일 여섯자리 (무단배포는 로그인 기록으로 추적가능합니다)"
 
-def log_login_history(emp_id: str, status: str, role: str = "-"):
-    """Google Sheets에 접속 이력 Append (고유 ID 방식)"""
+def log_login_history(emp_id: str, status: str, role: str = "-", fail_reason: str = "-"):
+    """Google Sheets에 접속 이력 Append (고도화 버전)"""
     try:
-        # Client IP 추출 (Streamlit Cloud 환경의 X-Forwarded-For 사용, 실패시 우회)
+        # 1. IP 및 User-Agent 추출
         client_ip = "Unknown"
+        user_agent = "Unknown"
         try:
             if hasattr(st, "context") and hasattr(st.context, "headers"):
                 client_ip = st.context.headers.get("X-Forwarded-For", "Unknown").split(",")[0].strip()
+                user_agent = st.context.headers.get("User-Agent", "Unknown")
         except:
             pass
 
+        # 2. 접속 국가 (Geo-Location) 조회 (무료 API 활용, 타임아웃 2초로 지연 최소화)
+        geo_country = "Unknown"
+        if client_ip != "Unknown" and client_ip != "127.0.0.1":
+            try:
+                # ip-api.com을 활용하여 IP의 국가 코드(예: KR, US)만 빠르게 가져옵니다.
+                res = requests.get(f"http://ip-api.com/json/{client_ip}?fields=countryCode", timeout=2)
+                if res.status_code == 200:
+                    geo_country = res.json().get("countryCode", "Unknown")
+            except:
+                pass
+
+        # 3. 세션/접속 방식 판별 (User-Agent 기반)
+        session_type = "Web"
+        if user_agent != "Unknown":
+            ua_lower = user_agent.lower()
+            if any(m in ua_lower for m in ['mobile', 'android', 'iphone', 'ipad']):
+                session_type = "Mobile"
+            elif "python" in ua_lower or "curl" in ua_lower or "bot" in ua_lower:
+                session_type = "API/Bot"
+
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         
-        # Secrets에서 인증 정보 로드
+        # 4. 구글 시트 인증 및 연결
         gcp_info = dict(st.secrets["gcp_service_account"])
         credentials = Credentials.from_service_account_info(
             gcp_info,
@@ -946,22 +968,18 @@ def log_login_history(emp_id: str, status: str, role: str = "-"):
         )
         client = gspread.authorize(credentials)
         
-        # ✅ URL의 고유 ID를 사용하여 정확하게 시트 지정
+        # 대상 구글 시트 ID 지정 및 첫 번째 워크시트(gid=0) 가져오기
         spreadsheet_id = "1Xy47qbTyAsKqsYSY5Pfe2hlZtXpRCv0mh9alB_9aITA"
         doc = client.open_by_key(spreadsheet_id)
-        
-        # ✅ 첫 번째 탭(워크시트)을 무조건 가져오도록 수정 
-        # (만약 탭 이름을 'Log'로 명시하고 싶다면 doc.worksheet("Log") 로 변경)
         sheet = doc.get_worksheet(0)
         
-        # 행 추가
-        log_row = [now_str, emp_id, client_ip, status, role]
+        # 5. 행 추가 (총 9개 항목)
+        log_row = [now_str, emp_id, client_ip, status, role, user_agent, geo_country, fail_reason, session_type]
         sheet.append_row(log_row)
         
     except Exception as e:
-        # 서비스 중단 방지를 위해 화면에 에러를 출력 (디버깅용)
-        # 상용화 시에는 st.error 라인을 지우거나 print 문으로 대체하세요.
-        st.error(f"구글 시트 로깅 실패: {e}")
+        # 상용 배포 시에는 사용자에게 에러를 노출하지 않고 print만 남깁니다.
+        print(f"구글 시트 로깅 실패: {e}")
 
 def login_gate():
     st.title("🔐 로그인")
@@ -976,36 +994,51 @@ def login_gate():
             dob_clean = str(dob_input).strip()
             
             user_role = None
+            fail_reason = "-"
             
-            # 1. 관리자 확인
-            if emp_clean == "2855" and dob_clean == "910518":
-                user_role = "admin"
-            # 2. Secrets 사용자 확인
+            # 1. 관리자 확인 및 상세 실패 사유 판별
+            if emp_clean == "2855":
+                if dob_clean == "910518":
+                    user_role = "admin"
+                else:
+                    fail_reason = "비밀번호 불일치"
+            # 2. 일반 사용자 확인 및 상세 실패 사유 판별
             else:
                 secret_users = _get_auth_users_from_secrets()
+                user_found = False
                 for u in secret_users:
                     u_emp = str(u.get("emp", "")).strip()
-                    u_dob = str(u.get("dob", "")).strip()
-                    if u_emp == emp_clean and u_dob == dob_clean:
-                        user_role = "user"
+                    if u_emp == emp_clean:
+                        user_found = True
+                        u_dob = str(u.get("dob", "")).strip()
+                        if u_dob == dob_clean:
+                            user_role = "user"
+                        else:
+                            fail_reason = "비밀번호 불일치"
                         break
+                
+                # 사번을 다 뒤졌는데도 매칭되는 사번이 없다면
+                if not user_found and emp_clean != "2855":
+                    fail_reason = "사번 없음"
 
+            # 3. 결과에 따른 로깅 처리
             if user_role:
                 # ✅ 성공 로깅
-                log_login_history(emp_clean, status="성공", role=user_role)
+                log_login_history(emp_clean, status="성공", role=user_role, fail_reason="-")
                 st.session_state["authed"] = True
                 st.session_state["role"] = user_role
                 st.success(f"로그인 성공! ({user_role})")
                 time.sleep(0.5)
                 st.rerun()
             else:
-                # 🚨 실패 로깅
-                log_login_history(emp_clean, status="실패", role="-")
+                # 🚨 실패 로깅 (분석된 실패 사유 기록)
+                if fail_reason == "-":
+                    fail_reason = "알 수 없는 오류"
+                log_login_history(emp_clean, status="실패", role="-", fail_reason=fail_reason)
                 st.error("인증 실패. 사번과 생년월일을 확인하세요.")
                 
     with col2:
         st.info(INFO_BOX)
-
 
 def render_sidebar_base():
     st.sidebar.title("📂 데이터 업로드")
