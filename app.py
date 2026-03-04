@@ -926,7 +926,7 @@ def normalize_vendor(name: str) -> str:
 INFO_BOX = "ID : 사번 네자리, PW :생년월일 여섯자리 (무단배포는 로그인 기록으로 추적가능합니다)"
 
 def log_login_history(emp_id: str, status: str, role: str = "-"):
-    """Google Sheets에 접속 이력 Append"""
+    """Google Sheets에 접속 이력 Append (고유 ID 방식)"""
     try:
         # Client IP 추출 (Streamlit Cloud 환경의 X-Forwarded-For 사용, 실패시 우회)
         client_ip = "Unknown"
@@ -938,7 +938,7 @@ def log_login_history(emp_id: str, status: str, role: str = "-"):
 
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         
-        # Secrets에서 인증 정보 로드 (AttrDict -> dict 변환)
+        # Secrets에서 인증 정보 로드
         gcp_info = dict(st.secrets["gcp_service_account"])
         credentials = Credentials.from_service_account_info(
             gcp_info,
@@ -946,16 +946,22 @@ def log_login_history(emp_id: str, status: str, role: str = "-"):
         )
         client = gspread.authorize(credentials)
         
-        # '접속이력DB' 시트의 'Log' 워크시트 연결
-        sheet = client.open("접속이력DB").worksheet("Log")
+        # ✅ URL의 고유 ID를 사용하여 정확하게 시트 지정
+        spreadsheet_id = "1Xy47qbTyAsKqsYSY5Pfe2hlZtXpRCv0mh9alB_9aITA"
+        doc = client.open_by_key(spreadsheet_id)
+        
+        # ✅ 첫 번째 탭(워크시트)을 무조건 가져오도록 수정 
+        # (만약 탭 이름을 'Log'로 명시하고 싶다면 doc.worksheet("Log") 로 변경)
+        sheet = doc.get_worksheet(0)
         
         # 행 추가
         log_row = [now_str, emp_id, client_ip, status, role]
         sheet.append_row(log_row)
         
     except Exception as e:
-        # 서비스 중단 방지를 위해 예외 무시
-        print(f"Logging failed: {e}")
+        # 서비스 중단 방지를 위해 화면에 에러를 출력 (디버깅용)
+        # 상용화 시에는 st.error 라인을 지우거나 print 문으로 대체하세요.
+        st.error(f"구글 시트 로깅 실패: {e}")
 
 def login_gate():
     st.title("🔐 로그인")
